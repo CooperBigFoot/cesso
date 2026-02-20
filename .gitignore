@@ -17,3 +17,6 @@ desktop.ini
 
 # Environment
 .env
+
+# Chess data (tablebases, opening books) — too large for git
+/data/
