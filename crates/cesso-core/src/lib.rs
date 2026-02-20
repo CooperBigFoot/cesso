@@ -1,5 +1,6 @@
 //! Core chess types: board representation, move generation, and game rules.
 
+mod attacks;
 mod bitboard;
 mod board;
 mod castle_rights;
@@ -24,4 +25,8 @@ pub use file::File;
 pub use piece::Piece;
 pub use piece_kind::PieceKind;
 pub use rank::Rank;
+pub use attacks::{
+    between, bishop_attacks, king_attacks, knight_attacks, line, pawn_attacks, queen_attacks,
+    rook_attacks,
+};
 pub use square::Square;
