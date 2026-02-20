@@ -37,7 +37,7 @@ File naming convention: `K[pieces]vK[pieces].rtb{w,z}` — e.g., `KRPvKR.rtbw` i
 
 For probing these in Rust, consider [Fathom](https://github.com/jdart1/Fathom) (C library, FFI-friendly) or a pure Rust port.
 
-**Source:** http://tablebase.sesse.net/syzygy/3-4-5/
+**Source:** <http://tablebase.sesse.net/syzygy/3-4-5/>
 
 ## Downloading
 

@@ -6,6 +6,7 @@ use crate::bitboard::Bitboard;
 use crate::castle_rights::CastleRights;
 use crate::color::Color;
 use crate::error::BoardError;
+use crate::piece::Piece;
 use crate::piece_kind::PieceKind;
 use crate::square::Square;
 
@@ -198,6 +199,20 @@ impl Board {
         self.occupied = self.sides[Color::White.index()] | self.sides[Color::Black.index()];
     }
 
+    /// Return the colored piece on the given square, if any.
+    pub fn colored_piece_on(&self, sq: Square) -> Option<Piece> {
+        let kind = self.piece_on(sq)?;
+        let color = self.color_on(sq)?;
+        Some(Piece::new(kind, color))
+    }
+
+    /// Toggle a packed piece into/out of the board arrays via XOR.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn toggle_piece_packed(&mut self, sq: Square, piece: Piece) {
+        self.toggle_piece(sq, piece.kind(), piece.color());
+    }
+
     /// Validate the structural integrity of the board.
     pub fn validate(&self) -> Result<(), BoardError> {
         // Check exactly one king per side
@@ -287,6 +302,7 @@ impl fmt::Display for PrettyBoard<'_> {
 mod tests {
     use super::Board;
     use crate::color::Color;
+    use crate::piece::Piece;
     use crate::piece_kind::PieceKind;
     use crate::square::Square;
 
@@ -349,5 +365,14 @@ mod tests {
         assert!(output.contains("r n b q k b n r"));
         assert!(output.contains("R N B Q K B N R"));
         assert!(output.contains("a b c d e f g h"));
+    }
+
+    #[test]
+    fn colored_piece_on_starting() {
+        let board = Board::starting_position();
+        assert_eq!(board.colored_piece_on(Square::E1), Some(Piece::WHITE_KING));
+        assert_eq!(board.colored_piece_on(Square::E8), Some(Piece::BLACK_KING));
+        assert_eq!(board.colored_piece_on(Square::D1), Some(Piece::WHITE_QUEEN));
+        assert_eq!(board.colored_piece_on(Square::E4), None);
     }
 }
