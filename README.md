@@ -6,7 +6,7 @@ A chess engine written in pure Rust.
 
 | # | Component | Status | Crate |
 |---|-----------|--------|-------|
-| 1 | Board representation | TODO | `cesso-core` |
+| 1 | Board representation | DONE | `cesso-core` |
 | 2 | Piece & move representation | TODO | `cesso-core` |
 | 3 | Move generation (+ legality) | TODO | `cesso-core` |
 | 4 | Search | TODO | `cesso-engine` |
