@@ -15,38 +15,38 @@ A chess engine written in pure Rust.
 | 5 | FEN parsing & serialization | DONE | `FromStr` / `Display` on `Board` |
 | 6 | Perft | DONE | Verified against reference positions through depth 5 |
 
-### Evaluation (cesso-engine) — IN PROGRESS
+### Evaluation (cesso-engine) — DONE
 
 | # | Component | Status | Notes |
 |---|-----------|--------|-------|
 | 7 | Score type | DONE | Packed mg/eg `Score(i32)`, tapered eval ready |
 | 8 | Game phase detection | DONE | Material-based phase in `[0, 24]` |
-| 9 | Piece-square tables | TODO | Tapered PSTs (mg + eg per piece per square) |
-| 10 | Material evaluation | TODO | Basic piece values via `Score` |
-| 11 | Pawn structure | TODO | Passed, isolated, doubled, backward pawns |
-| 12 | Piece evaluation | TODO | Mobility, outposts, rook on open files |
-| 13 | King safety | TODO | Pawn shield, king tropism |
+| 9 | Piece-square tables | DONE | PeSTO-style tapered PSTs for all 6 piece types |
+| 10 | Material evaluation | DONE | Piece values + bishop pair bonus |
+| 11 | Pawn structure | DONE | Passed, isolated, doubled, backward pawns |
+| 12 | Piece mobility | DONE | Safe-square counting for N/B/R/Q |
+| 13 | King safety | DONE | Pawn shield (V1) |
 
-### Search (cesso-engine) — TODO
+### Search (cesso-engine) — IN PROGRESS
 
 | # | Component | Status | Notes |
 |---|-----------|--------|-------|
-| 14 | Negamax + alpha-beta | TODO | Core search framework |
-| 15 | Iterative deepening | TODO | Required for time management and `stop` |
-| 16 | Move ordering | TODO | MVV-LVA, killer moves, history heuristic |
-| 17 | Quiescence search | TODO | Capture-only search to avoid horizon effect |
+| 14 | Negamax + alpha-beta | DONE | Core search with beta cutoffs |
+| 15 | Iterative deepening | DONE | Depth 1..N with per-iteration callback |
+| 16 | Move ordering | DONE | MVV-LVA via `MovePicker` selection sort |
+| 17 | Quiescence search | DONE | Captures + promotions, stand-pat, ply ceiling |
 | 18 | Transposition table | TODO | Zobrist hashing, TT probing/storing |
 | 19 | Time management | TODO | Clock-based search budgeting |
 
-### UCI Protocol (cesso-uci) — TODO
+### UCI Protocol (cesso-uci) — DONE
 
 | # | Component | Status | Notes |
 |---|-----------|--------|-------|
-| 20 | Command parser | TODO | Parse `uci`, `position`, `go`, `stop`, `quit` |
-| 21 | Response formatter | TODO | Format `id`, `uciok`, `bestmove`, `info` |
-| 22 | UCI loop | TODO | stdin/stdout I/O, threading for `stop` |
-| 23 | UCI move parsing | TODO | Map UCI strings to legal `Move` values |
-| 24 | Wire up main binary | TODO | `src/main.rs` → `cesso_uci::run()` |
+| 20 | Command parser | DONE | `position`, `go depth`, `stop`, `quit`, etc. |
+| 21 | Response formatter | DONE | `id`, `uciok`, `readyok`, `bestmove`, `info` lines |
+| 22 | UCI loop | DONE | stdin line reader, dispatches to handlers |
+| 23 | UCI move parsing | DONE | `Move::from_uci` with castling/EP/promotion disambiguation |
+| 24 | Wire up main binary | DONE | `src/main.rs` → `UciEngine::new().run()` |
 
 ### Lichess Deployment — TODO
 
