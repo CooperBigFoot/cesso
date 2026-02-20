@@ -213,6 +213,36 @@ impl Board {
         self.toggle_piece(sq, piece.kind(), piece.color());
     }
 
+    /// Set the en passant target square.
+    #[inline]
+    pub(crate) fn set_en_passant(&mut self, sq: Option<Square>) {
+        self.en_passant = sq;
+    }
+
+    /// Set the castling rights.
+    #[inline]
+    pub(crate) fn set_castling(&mut self, rights: CastleRights) {
+        self.castling = rights;
+    }
+
+    /// Set the halfmove clock.
+    #[inline]
+    pub(crate) fn set_halfmove_clock(&mut self, clock: u16) {
+        self.halfmove_clock = clock;
+    }
+
+    /// Set the side to move.
+    #[inline]
+    pub(crate) fn set_side_to_move(&mut self, color: Color) {
+        self.side_to_move = color;
+    }
+
+    /// Set the fullmove number.
+    #[inline]
+    pub(crate) fn set_fullmove_number(&mut self, number: u16) {
+        self.fullmove_number = number;
+    }
+
     /// Validate the structural integrity of the board.
     pub fn validate(&self) -> Result<(), BoardError> {
         // Check exactly one king per side

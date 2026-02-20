@@ -9,6 +9,9 @@ mod color;
 mod error;
 mod fen;
 mod file;
+mod make_move;
+mod movegen;
+mod perft;
 mod piece;
 mod piece_kind;
 mod rank;
@@ -29,4 +32,6 @@ pub use attacks::{
     between, bishop_attacks, king_attacks, knight_attacks, line, pawn_attacks, queen_attacks,
     rook_attacks,
 };
+pub use movegen::{generate_legal_moves, MoveList};
+pub use perft::{divide, perft};
 pub use square::Square;

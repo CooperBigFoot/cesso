@@ -8,7 +8,7 @@ A chess engine written in pure Rust.
 |---|-----------|--------|-------|
 | 1 | Board representation | DONE | `cesso-core` |
 | 2 | Piece & move representation | DONE | `cesso-core` |
-| 3 | Move generation (+ legality) | TODO | `cesso-core` |
+| 3 | Move generation (+ legality) | DONE | `cesso-core` |
 | 4 | Search | TODO | `cesso-engine` |
 | 5 | Evaluation | TODO | `cesso-engine` |
 | 6 | Time management | TODO | `cesso-engine` |
