@@ -1,0 +1,10 @@
+[package]
+name = "cesso-uci"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cesso-core = { path = "../cesso-core" }
+cesso-engine = { path = "../cesso-engine" }
+thiserror = "2"
+tracing = "0.1"

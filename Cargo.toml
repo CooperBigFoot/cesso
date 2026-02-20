@@ -1,0 +1,19 @@
+[package]
+name = "cesso"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cesso-core = { path = "crates/cesso-core" }
+cesso-engine = { path = "crates/cesso-engine" }
+cesso-uci = { path = "crates/cesso-uci" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[workspace]
+members = [
+    "crates/cesso-core",
+    "crates/cesso-engine",
+    "crates/cesso-uci",
+]
