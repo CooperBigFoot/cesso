@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::board::Board;
 use crate::piece_kind::PieceKind;
 use crate::square::Square;
 
@@ -196,6 +197,53 @@ impl Move {
             format!("{}{}", self.source(), self.dest())
         }
     }
+
+    /// Parse a UCI move string (e.g. "e2e4", "e7e8q") in the context of a [`Board`].
+    ///
+    /// The board is needed to disambiguate castling and en-passant moves from
+    /// normal moves, since UCI notation does not encode move kind explicitly.
+    ///
+    /// Returns `None` if the string is malformed.
+    pub fn from_uci(s: &str, board: &Board) -> Option<Move> {
+        let len = s.len();
+        if len < 4 || len > 5 {
+            return None;
+        }
+
+        let src = Square::from_algebraic(&s[0..2])?;
+        let dst = Square::from_algebraic(&s[2..4])?;
+
+        // If length 5, it is a promotion.
+        if len == 5 {
+            let promo = match s.as_bytes()[4] {
+                b'q' => PromotionPiece::Queen,
+                b'r' => PromotionPiece::Rook,
+                b'b' => PromotionPiece::Bishop,
+                b'n' => PromotionPiece::Knight,
+                _ => return None,
+            };
+            return Some(Move::new_promotion(src, dst, promo));
+        }
+
+        // Castling: king moving exactly 2 files.
+        if board.piece_on(src) == Some(PieceKind::King) {
+            let file_diff = (src.file().index() as i8 - dst.file().index() as i8).unsigned_abs();
+            if file_diff == 2 {
+                return Some(Move::new_castle(src, dst));
+            }
+        }
+
+        // En passant: pawn moving diagonally to the EP target square.
+        if board.piece_on(src) == Some(PieceKind::Pawn)
+            && board.en_passant() == Some(dst)
+            && src.file() != dst.file()
+        {
+            return Some(Move::new_en_passant(src, dst));
+        }
+
+        // Normal move (quiet or capture).
+        Some(Move::new(src, dst))
+    }
 }
 
 impl fmt::Display for Move {
@@ -221,6 +269,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{Move, MoveKind, PromotionPiece};
+    use crate::board::Board;
     use crate::piece_kind::PieceKind;
     use crate::square::Square;
 
@@ -389,5 +438,98 @@ mod tests {
                 assert_eq!(mv.kind(), MoveKind::Normal, "kind mismatch for {src}→{dst}");
             }
         }
+    }
+
+    #[test]
+    fn from_uci_normal_move() {
+        let board = Board::starting_position();
+        let mv = Move::from_uci("e2e4", &board).unwrap();
+        assert_eq!(mv.source(), Square::E2);
+        assert_eq!(mv.dest(), Square::E4);
+        assert_eq!(mv.kind(), MoveKind::Normal);
+    }
+
+    #[test]
+    fn from_uci_roundtrip() {
+        let board = Board::starting_position();
+        let mv = Move::from_uci("e2e4", &board).unwrap();
+        assert_eq!(mv.to_uci(), "e2e4");
+    }
+
+    #[test]
+    fn from_uci_castling_kingside() {
+        let board: Board = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1"
+            .parse()
+            .unwrap();
+        let mv = Move::from_uci("e1g1", &board).unwrap();
+        assert_eq!(mv.kind(), MoveKind::Castling);
+        assert_eq!(mv.source(), Square::E1);
+        assert_eq!(mv.dest(), Square::G1);
+    }
+
+    #[test]
+    fn from_uci_castling_queenside() {
+        let board: Board = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1"
+            .parse()
+            .unwrap();
+        let mv = Move::from_uci("e1c1", &board).unwrap();
+        assert_eq!(mv.kind(), MoveKind::Castling);
+        assert_eq!(mv.source(), Square::E1);
+        assert_eq!(mv.dest(), Square::C1);
+    }
+
+    #[test]
+    fn from_uci_en_passant() {
+        let board: Board = "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3"
+            .parse()
+            .unwrap();
+        let mv = Move::from_uci("e5d6", &board).unwrap();
+        assert_eq!(mv.kind(), MoveKind::EnPassant);
+    }
+
+    #[test]
+    fn from_uci_promotion_queen() {
+        let board: Board = "4k3/4P3/8/8/8/8/8/4K3 w - - 0 1"
+            .parse()
+            .unwrap();
+        let mv = Move::from_uci("e7e8q", &board).unwrap();
+        assert_eq!(mv.kind(), MoveKind::Promotion);
+        assert_eq!(mv.promotion_piece(), PromotionPiece::Queen);
+    }
+
+    #[test]
+    fn from_uci_promotion_knight() {
+        let board: Board = "4k3/4P3/8/8/8/8/8/4K3 w - - 0 1"
+            .parse()
+            .unwrap();
+        let mv = Move::from_uci("e7e8n", &board).unwrap();
+        assert_eq!(mv.kind(), MoveKind::Promotion);
+        assert_eq!(mv.promotion_piece(), PromotionPiece::Knight);
+    }
+
+    #[test]
+    fn from_uci_invalid_too_short() {
+        let board = Board::starting_position();
+        assert!(Move::from_uci("e2", &board).is_none());
+    }
+
+    #[test]
+    fn from_uci_invalid_too_long() {
+        let board = Board::starting_position();
+        assert!(Move::from_uci("e2e4qq", &board).is_none());
+    }
+
+    #[test]
+    fn from_uci_invalid_square() {
+        let board = Board::starting_position();
+        assert!(Move::from_uci("z9e4", &board).is_none());
+    }
+
+    #[test]
+    fn from_uci_invalid_promotion_char() {
+        let board: Board = "4k3/4P3/8/8/8/8/8/4K3 w - - 0 1"
+            .parse()
+            .unwrap();
+        assert!(Move::from_uci("e7e8x", &board).is_none());
     }
 }
