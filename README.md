@@ -35,7 +35,7 @@ A chess engine written in pure Rust.
 | 15 | Iterative deepening | DONE | Depth 1..N with per-iteration callback |
 | 16 | Move ordering | DONE | MVV-LVA via `MovePicker` selection sort |
 | 17 | Quiescence search | DONE | Captures + promotions, stand-pat, ply ceiling |
-| 18 | Transposition table | TODO | Zobrist hashing, TT probing/storing |
+| 18 | Transposition table | DONE | Zobrist hashing, 16MB TT with generation replacement, TT move ordering |
 | 19 | Time management | TODO | Clock-based search budgeting |
 
 ### UCI Protocol (cesso-uci) — DONE
