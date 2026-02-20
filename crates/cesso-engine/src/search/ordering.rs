@@ -64,7 +64,10 @@ pub struct MovePicker {
 
 impl MovePicker {
     /// Create a picker that yields all legal moves, ordered by score.
-    pub fn new(moves: &MoveList, board: &Board) -> Self {
+    ///
+    /// If `tt_move` is not null and matches a move in the list, it receives
+    /// the highest priority score (10,000), ensuring it is searched first.
+    pub fn new(moves: &MoveList, board: &Board, tt_move: Move) -> Self {
         let mut picker = Self {
             moves: [Move::NULL; 256],
             scores: [0; 256],
@@ -74,7 +77,11 @@ impl MovePicker {
         };
         for i in 0..moves.len() {
             picker.moves[i] = moves[i];
-            picker.scores[i] = score_move(board, moves[i]);
+            picker.scores[i] = if moves[i] == tt_move {
+                10_000
+            } else {
+                score_move(board, moves[i])
+            };
         }
         picker
     }
@@ -190,7 +197,7 @@ mod tests {
     fn picker_yields_all_moves_in_starting_position() {
         let board = Board::starting_position();
         let moves = generate_legal_moves(&board);
-        let mut picker = MovePicker::new(&moves, &board);
+        let mut picker = MovePicker::new(&moves, &board, Move::NULL);
         let mut count = 0;
         while picker.pick_next().is_some() {
             count += 1;
@@ -204,7 +211,7 @@ mod tests {
         // White queen on d4, black pawn on e5 — QxP is a capture
         let board: Board = "4k3/8/8/4p3/3Q4/8/8/4K3 w - - 0 1".parse().unwrap();
         let moves = generate_legal_moves(&board);
-        let mut picker = MovePicker::new(&moves, &board);
+        let mut picker = MovePicker::new(&moves, &board, Move::NULL);
         let first = picker.pick_next().unwrap();
         // First move should be the capture (highest scored)
         assert!(

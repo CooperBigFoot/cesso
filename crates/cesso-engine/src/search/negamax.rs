@@ -4,6 +4,7 @@ use cesso_core::{Board, Move, generate_legal_moves};
 
 use crate::evaluate;
 use crate::search::ordering::MovePicker;
+use crate::search::tt::{Bound, TranspositionTable};
 
 /// Score representing an unreachable upper/lower bound.
 pub const INF: i32 = 30_000;
@@ -29,6 +30,7 @@ pub(super) fn negamax(
     beta: i32,
     nodes: &mut u64,
     root_best_move: &mut Move,
+    tt: &mut TranspositionTable,
 ) -> i32 {
     *nodes += 1;
 
@@ -37,7 +39,28 @@ pub(super) fn negamax(
         return 0;
     }
 
-    // TODO(Phase 3): threefold repetition via Zobrist hash
+    // Probe transposition table
+    let mut tt_move = Move::NULL;
+    if let Some(tt_entry) = tt.probe(board.hash(), ply) {
+        tt_move = tt_entry.best_move;
+        // Cutoff if the stored depth is sufficient
+        if tt_entry.depth >= depth {
+            match tt_entry.bound {
+                Bound::Exact => return tt_entry.score,
+                Bound::LowerBound => {
+                    if tt_entry.score >= beta {
+                        return tt_entry.score;
+                    }
+                }
+                Bound::UpperBound => {
+                    if tt_entry.score <= alpha {
+                        return tt_entry.score;
+                    }
+                }
+                Bound::None => {}
+            }
+        }
+    }
 
     // Leaf node — drop into quiescence search
     if depth == 0 {
@@ -57,15 +80,18 @@ pub(super) fn negamax(
         };
     }
 
+    let original_alpha = alpha;
     let mut best_score = -INF;
-    let mut picker = MovePicker::new(&moves, board);
+    let mut best_move = Move::NULL;
+    let mut picker = MovePicker::new(&moves, board, tt_move);
 
     while let Some(mv) = picker.pick_next() {
         let child = board.make_move(mv);
-        let score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, nodes, root_best_move);
+        let score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, nodes, root_best_move, tt);
 
         if score > best_score {
             best_score = score;
+            best_move = mv;
             if ply == 0 {
                 *root_best_move = mv;
             }
@@ -79,6 +105,17 @@ pub(super) fn negamax(
             break;
         }
     }
+
+    // Determine bound type and store in TT
+    let bound = if best_score <= original_alpha {
+        Bound::UpperBound
+    } else if best_score >= beta {
+        Bound::LowerBound
+    } else {
+        Bound::Exact
+    };
+
+    tt.store(board.hash(), depth, best_score, 0, best_move, bound, ply);
 
     best_score
 }

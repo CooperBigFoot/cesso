@@ -184,6 +184,18 @@ impl Move {
         (self.0 & KIND_MASK) >> KIND_SHIFT == MoveKind::Normal as u16
     }
 
+    /// Return the raw u16 bit representation.
+    #[inline]
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+
+    /// Create a move from a raw u16 bit representation.
+    #[inline]
+    pub const fn from_raw(bits: u16) -> Move {
+        Move(bits)
+    }
+
     /// Return the UCI string representation.
     ///
     /// # Panics

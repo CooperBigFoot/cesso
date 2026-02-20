@@ -67,7 +67,7 @@ impl UciEngine {
 
     fn handle_ucinewgame(&mut self) {
         self.board = Board::starting_position();
-        self.searcher = Searcher::new();
+        self.searcher.clear_tt();
     }
 
     fn handle_position(&mut self, board: Board) {

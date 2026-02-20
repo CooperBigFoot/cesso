@@ -126,7 +126,7 @@ impl FromStr for Board {
                     found: fields[5].to_string(),
                 })?;
 
-        let board = Board::from_raw(
+        let mut board = Board::from_raw(
             pieces,
             sides,
             occupied,
@@ -135,7 +135,12 @@ impl FromStr for Board {
             en_passant,
             halfmove_clock,
             fullmove_number,
+            0, // placeholder hash
         );
+
+        // Compute and set the real Zobrist hash
+        let hash = crate::zobrist::hash_from_scratch(&board);
+        board.set_hash(hash);
 
         board.validate()?;
         Ok(board)

@@ -9,6 +9,7 @@ use crate::error::BoardError;
 use crate::piece::Piece;
 use crate::piece_kind::PieceKind;
 use crate::square::Square;
+use crate::zobrist;
 
 /// Complete chess position state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub struct Board {
     halfmove_clock: u16,
     /// Fullmove number (starts at 1, incremented after Black moves).
     fullmove_number: u16,
+    /// Zobrist hash of the position.
+    hash: u64,
 }
 
 impl Board {
@@ -73,7 +76,7 @@ impl Board {
         let black = black_pawns | black_knights | black_bishops | black_rooks | black_queens | black_king;
         let occupied = white | black;
 
-        Board {
+        let mut board = Board {
             pieces: [pawns, knights, bishops, rooks, queens, kings],
             sides: [white, black],
             occupied,
@@ -82,7 +85,10 @@ impl Board {
             en_passant: None,
             halfmove_clock: 0,
             fullmove_number: 1,
-        }
+            hash: 0,
+        };
+        board.hash = zobrist::hash_from_scratch(&board);
+        board
     }
 
     /// Construct a board from raw components. Used by FEN parsing.
@@ -96,6 +102,7 @@ impl Board {
         en_passant: Option<Square>,
         halfmove_clock: u16,
         fullmove_number: u16,
+        hash: u64,
     ) -> Board {
         Board {
             pieces,
@@ -106,6 +113,7 @@ impl Board {
             en_passant,
             halfmove_clock,
             fullmove_number,
+            hash,
         }
     }
 
@@ -187,6 +195,18 @@ impl Board {
     #[inline]
     pub fn fullmove_number(&self) -> u16 {
         self.fullmove_number
+    }
+
+    /// Return the Zobrist hash of the position.
+    #[inline]
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    /// Set the Zobrist hash.
+    #[inline]
+    pub(crate) fn set_hash(&mut self, hash: u64) {
+        self.hash = hash;
     }
 
     /// Toggle a piece into/out of the board arrays via XOR.

@@ -16,6 +16,7 @@ mod piece;
 mod piece_kind;
 mod rank;
 mod square;
+mod zobrist;
 
 pub use bitboard::Bitboard;
 pub use board::{Board, PrettyBoard};

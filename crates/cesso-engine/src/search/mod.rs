@@ -2,10 +2,12 @@
 
 pub mod negamax;
 pub mod ordering;
+pub mod tt;
 
 use cesso_core::{Board, Move};
 
 use negamax::{negamax, INF};
+use tt::TranspositionTable;
 
 /// Result of a completed search.
 #[derive(Debug, Clone)]
@@ -20,20 +22,26 @@ pub struct SearchResult {
     pub depth: u8,
 }
 
-/// Iterative-deepening searcher.
-#[derive(Debug)]
+/// Iterative-deepening searcher with transposition table.
 pub struct Searcher {
     nodes: u64,
     best_move: Move,
+    tt: TranspositionTable,
 }
 
 impl Searcher {
-    /// Create a fresh searcher.
+    /// Create a fresh searcher with a 16 MB transposition table.
     pub fn new() -> Self {
         Self {
             nodes: 0,
             best_move: Move::NULL,
+            tt: TranspositionTable::new(16),
         }
+    }
+
+    /// Clear the transposition table (preserving the allocation).
+    pub fn clear_tt(&mut self) {
+        self.tt.clear();
     }
 
     /// Run iterative-deepening search up to `max_depth`.
@@ -51,6 +59,7 @@ impl Searcher {
     {
         self.nodes = 0;
         self.best_move = Move::NULL;
+        self.tt.new_generation();
 
         let mut best_score = -INF;
 
@@ -63,6 +72,7 @@ impl Searcher {
                 INF,
                 &mut self.nodes,
                 &mut self.best_move,
+                &mut self.tt,
             );
             best_score = score;
             on_iter(depth, score, self.nodes, self.best_move);
@@ -74,6 +84,16 @@ impl Searcher {
             nodes: self.nodes,
             depth: max_depth,
         }
+    }
+}
+
+impl std::fmt::Debug for Searcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Searcher")
+            .field("nodes", &self.nodes)
+            .field("best_move", &self.best_move)
+            .field("tt", &self.tt)
+            .finish()
     }
 }
 

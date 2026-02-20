@@ -6,8 +6,10 @@ use crate::board::Board;
 use crate::castle_rights::CastleRights;
 use crate::chess_move::{Move, MoveKind};
 use crate::color::Color;
+use crate::piece::Piece;
 use crate::piece_kind::PieceKind;
 use crate::square::Square;
+use crate::zobrist;
 
 /// Maps each square index to the castling rights that must be removed when
 /// that square is the source or destination of any move.
@@ -100,6 +102,14 @@ impl Board {
             None => return b,
         };
 
+        // XOR out old en passant file from hash (before clearing).
+        if let Some(old_ep) = b.en_passant() {
+            b.set_hash(b.hash() ^ zobrist::EN_PASSANT_FILE[old_ep.file().index()]);
+        }
+
+        // XOR out old castling rights from hash (before any modifications).
+        b.set_hash(b.hash() ^ zobrist::CASTLING[b.castling().bits() as usize]);
+
         // Clear en passant target set by the previous move.
         b.set_en_passant(None);
 
@@ -112,11 +122,15 @@ impl Board {
                 // Remove the captured piece (if any) before placing ours.
                 if is_capture && let Some(captured_kind) = b.piece_on(dst) {
                     b.toggle_piece(dst, captured_kind, them);
+                    b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(captured_kind, them).index()][dst.index()]);
                 }
 
                 // Move our piece: XOR it off src and onto dst.
                 b.toggle_piece(src, moving_piece, us);
                 b.toggle_piece(dst, moving_piece, us);
+                let piece_idx = Piece::new(moving_piece, us).index();
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[piece_idx][src.index()]);
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[piece_idx][dst.index()]);
 
                 // Record en passant target square after a double pawn push.
                 if moving_piece == PieceKind::Pawn {
@@ -136,20 +150,26 @@ impl Board {
                 // Remove the captured piece at the promotion square (if any).
                 if is_capture && let Some(captured_kind) = b.piece_on(dst) {
                     b.toggle_piece(dst, captured_kind, them);
+                    b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(captured_kind, them).index()][dst.index()]);
                 }
 
                 // Remove the promoting pawn from src.
                 b.toggle_piece(src, PieceKind::Pawn, us);
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(PieceKind::Pawn, us).index()][src.index()]);
 
                 // Place the promoted piece on dst.
                 let promo_kind = mv.promotion_piece().to_piece_kind();
                 b.toggle_piece(dst, promo_kind, us);
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(promo_kind, us).index()][dst.index()]);
             }
 
             MoveKind::EnPassant => {
                 // Move our pawn to the en passant target square.
                 b.toggle_piece(src, PieceKind::Pawn, us);
                 b.toggle_piece(dst, PieceKind::Pawn, us);
+                let pawn_idx = Piece::new(PieceKind::Pawn, us).index();
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[pawn_idx][src.index()]);
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[pawn_idx][dst.index()]);
 
                 // Remove the captured pawn, which stands on the same rank as
                 // `src` and the same file as `dst` — one rank behind `dst`.
@@ -160,6 +180,7 @@ impl Board {
                 };
                 if let Some(captured_sq) = Square::from_index(captured_idx as u8) {
                     b.toggle_piece(captured_sq, PieceKind::Pawn, them);
+                    b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(PieceKind::Pawn, them).index()][captured_sq.index()]);
                 }
             }
 
@@ -167,6 +188,9 @@ impl Board {
                 // Move the king.
                 b.toggle_piece(src, PieceKind::King, us);
                 b.toggle_piece(dst, PieceKind::King, us);
+                let king_idx = Piece::new(PieceKind::King, us).index();
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[king_idx][src.index()]);
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[king_idx][dst.index()]);
 
                 // Move the rook to its post-castling square.
                 let (rook_src, rook_dst) = match dst.index() {
@@ -178,6 +202,9 @@ impl Board {
                 };
                 b.toggle_piece(rook_src, PieceKind::Rook, us);
                 b.toggle_piece(rook_dst, PieceKind::Rook, us);
+                let rook_idx = Piece::new(PieceKind::Rook, us).index();
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[rook_idx][rook_src.index()]);
+                b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[rook_idx][rook_dst.index()]);
             }
         }
 
@@ -188,6 +215,14 @@ impl Board {
             .remove(CASTLE_RIGHTS_REVOKE[dst.index()]);
         b.set_castling(new_castling);
 
+        // XOR in new castling rights.
+        b.set_hash(b.hash() ^ zobrist::CASTLING[new_castling.bits() as usize]);
+
+        // XOR in new en passant file (if set by a double pawn push).
+        if let Some(ep_sq) = b.en_passant() {
+            b.set_hash(b.hash() ^ zobrist::EN_PASSANT_FILE[ep_sq.file().index()]);
+        }
+
         // Update the halfmove clock (reset on pawn moves and captures).
         if moving_piece == PieceKind::Pawn || is_capture || mv.kind() == MoveKind::EnPassant {
             b.set_halfmove_clock(0);
@@ -197,6 +232,9 @@ impl Board {
 
         // Switch the side to move.
         b.set_side_to_move(them);
+
+        // XOR side-to-move key (always changes).
+        b.set_hash(b.hash() ^ zobrist::SIDE_TO_MOVE);
 
         // Increment the fullmove counter after Black's move.
         if us == Color::Black {
@@ -371,5 +409,141 @@ mod tests {
         assert!(board.is_square_attacked(Square::F3, Color::White));
         // f6 attacked by the black knight on g8.
         assert!(board.is_square_attacked(Square::F6, Color::Black));
+    }
+
+    // --- Incremental Zobrist hash tests ---
+
+    #[test]
+    fn incremental_hash_normal_move() {
+        let board = starting();
+        let after = board.make_move(Move::new(Square::E2, Square::E4));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+    }
+
+    #[test]
+    fn incremental_hash_capture() {
+        // 1.e4 d5 2.exd5
+        let b = starting()
+            .make_move(Move::new(Square::E2, Square::E4))
+            .make_move(Move::new(Square::D7, Square::D5));
+        let after = b.make_move(Move::new(Square::E4, Square::D5));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+    }
+
+    #[test]
+    fn incremental_hash_double_pawn_push() {
+        let board = starting();
+        let after = board.make_move(Move::new(Square::E2, Square::E4));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+        assert!(after.en_passant().is_some());
+    }
+
+    #[test]
+    fn incremental_hash_en_passant() {
+        let b = starting()
+            .make_move(Move::new(Square::E2, Square::E4))
+            .make_move(Move::new(Square::A7, Square::A6))
+            .make_move(Move::new(Square::E4, Square::E5))
+            .make_move(Move::new(Square::D7, Square::D5));
+        // Verify each intermediate board
+        assert_eq!(b.hash(), crate::zobrist::hash_from_scratch(&b));
+        let after = b.make_move(Move::new_en_passant(Square::E5, Square::D6));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+    }
+
+    #[test]
+    fn incremental_hash_kingside_castling() {
+        let board: Board = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1"
+            .parse()
+            .unwrap();
+        let after = board.make_move(Move::new_castle(Square::E1, Square::G1));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+    }
+
+    #[test]
+    fn incremental_hash_queenside_castling() {
+        let board: Board = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1"
+            .parse()
+            .unwrap();
+        let after = board.make_move(Move::new_castle(Square::E1, Square::C1));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+    }
+
+    #[test]
+    fn incremental_hash_black_castling() {
+        let board: Board = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R b KQkq - 0 1"
+            .parse()
+            .unwrap();
+        let after = board.make_move(Move::new_castle(Square::E8, Square::G8));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+        let after2 = board.make_move(Move::new_castle(Square::E8, Square::C8));
+        assert_eq!(after2.hash(), crate::zobrist::hash_from_scratch(&after2));
+    }
+
+    #[test]
+    fn incremental_hash_promotion() {
+        let board: Board = "4k3/4P3/8/8/8/8/8/4K3 w - - 0 1".parse().unwrap();
+        for promo in crate::chess_move::PromotionPiece::ALL {
+            let after = board.make_move(Move::new_promotion(Square::E7, Square::E8, promo));
+            assert_eq!(
+                after.hash(),
+                crate::zobrist::hash_from_scratch(&after),
+                "hash mismatch for promotion to {:?}",
+                promo
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_hash_capture_promotion() {
+        let board: Board = "3rk3/4P3/8/8/8/8/8/4K3 w - - 0 1".parse().unwrap();
+        let after = board.make_move(Move::new_promotion(
+            Square::E7,
+            Square::D8,
+            PromotionPiece::Queen,
+        ));
+        assert_eq!(after.hash(), crate::zobrist::hash_from_scratch(&after));
+    }
+
+    #[test]
+    fn transposition_same_hash() {
+        // 1.Nf3 Nf6 2.Nc3 Nc6 vs 1.Nc3 Nc6 2.Nf3 Nf6 — same position!
+        let path_a = starting()
+            .make_move(Move::new(Square::G1, Square::F3)) // 1.Nf3
+            .make_move(Move::new(Square::G8, Square::F6)) // 1...Nf6
+            .make_move(Move::new(Square::B1, Square::C3)) // 2.Nc3
+            .make_move(Move::new(Square::B8, Square::C6)); // 2...Nc6
+
+        let path_b = starting()
+            .make_move(Move::new(Square::B1, Square::C3)) // 1.Nc3
+            .make_move(Move::new(Square::B8, Square::C6)) // 1...Nc6
+            .make_move(Move::new(Square::G1, Square::F3)) // 2.Nf3
+            .make_move(Move::new(Square::G8, Square::F6)); // 2...Nf6
+
+        assert_eq!(path_a.hash(), path_b.hash(), "transposed positions should have equal hashes");
+    }
+
+    #[test]
+    fn incremental_hash_many_moves_sequence() {
+        // Play a longer sequence and verify hash after each move
+        let moves = [
+            Move::new(Square::E2, Square::E4),
+            Move::new(Square::E7, Square::E5),
+            Move::new(Square::G1, Square::F3),
+            Move::new(Square::B8, Square::C6),
+            Move::new(Square::F1, Square::B5),
+            Move::new(Square::A7, Square::A6),
+        ];
+
+        let mut board = starting();
+        for mv in &moves {
+            board = board.make_move(*mv);
+            assert_eq!(
+                board.hash(),
+                crate::zobrist::hash_from_scratch(&board),
+                "hash mismatch after move {}",
+                mv
+            );
+        }
     }
 }
