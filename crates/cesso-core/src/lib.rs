@@ -3,6 +3,7 @@
 mod bitboard;
 mod board;
 mod castle_rights;
+mod chess_move;
 mod color;
 mod error;
 mod fen;
@@ -15,6 +16,7 @@ mod square;
 pub use bitboard::Bitboard;
 pub use board::{Board, PrettyBoard};
 pub use castle_rights::{CastleRights, CastleSide};
+pub use chess_move::{Move, MoveKind, PromotionPiece};
 pub use color::Color;
 pub use error::{BoardError, FenError};
 pub use fen::STARTING_FEN;
