@@ -30,7 +30,7 @@ pub fn game_phase(board: &Board) -> i32 {
     let rooks = board.pieces(PieceKind::Rook).count() as i32;
     let queens = board.pieces(PieceKind::Queen).count() as i32;
 
-    let phase = knights * 1 + bishops * 1 + rooks * 2 + queens * 4;
+    let phase = knights + bishops + rooks * 2 + queens * 4;
     phase.min(MAX_PHASE)
 }
 
