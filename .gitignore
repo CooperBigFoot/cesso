@@ -19,4 +19,5 @@ desktop.ini
 .env
 
 # Chess data (tablebases, opening books) — too large for git
-/data/
+/data/*
+!/data/README.md
