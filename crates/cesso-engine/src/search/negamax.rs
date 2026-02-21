@@ -201,6 +201,57 @@ pub(super) fn negamax(
     best_score
 }
 
+/// Aspiration window search — wraps [`negamax`] with a narrow window
+/// that widens on fail-high/fail-low.
+///
+/// For depths 1-4 or near-mate scores, uses a full window.
+/// For deeper searches, starts with `delta = 50` centered on `prev_score`.
+pub(super) fn aspiration_search(
+    board: &Board,
+    depth: u8,
+    prev_score: i32,
+    ctx: &mut SearchContext<'_>,
+) -> i32 {
+    // Full window for shallow depths or near-mate scores
+    if depth <= 4 || prev_score.abs() >= MATE_THRESHOLD {
+        return negamax(board, depth, 0, -INF, INF, true, ctx);
+    }
+
+    let mut delta: i32 = 50;
+    let mut alpha = (prev_score - delta).max(-INF);
+    let mut beta = (prev_score + delta).min(INF);
+
+    loop {
+        let score = negamax(board, depth, 0, alpha, beta, true, ctx);
+
+        // Abort immediately if the search was stopped
+        if ctx.control.should_stop(ctx.nodes) {
+            return score;
+        }
+
+        if score <= alpha {
+            // Fail low — widen alpha
+            delta *= 4;
+            alpha = (prev_score - delta).max(-INF);
+            if delta > INF {
+                alpha = -INF;
+                beta = INF;
+            }
+        } else if score >= beta {
+            // Fail high — widen beta
+            delta *= 4;
+            beta = (prev_score + delta).min(INF);
+            if delta > INF {
+                alpha = -INF;
+                beta = INF;
+            }
+        } else {
+            // Score is within the window — done
+            return score;
+        }
+    }
+}
+
 /// Quiescence search — resolve tactical sequences before evaluating.
 ///
 /// Only considers captures and promotions (via [`MovePicker::new_qsearch`])

@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cesso_core::{Board, Move};
 
 use crate::search::control::SearchControl;
-use crate::search::negamax::{INF, PvTable, SearchContext, negamax};
+use crate::search::heuristics::{HistoryTable, KillerTable};
+use crate::search::negamax::{INF, PvTable, SearchContext, aspiration_search};
 use crate::search::tt::TranspositionTable;
 use crate::search::SearchResult;
 
@@ -115,23 +116,28 @@ impl ThreadPool {
             tt: &self.tt,
             pv: PvTable::new(),
             control,
+            killers: KillerTable::new(),
+            history: HistoryTable::new(),
         };
 
         let mut completed_move = Move::NULL;
         let mut completed_score = -INF;
         let mut completed_depth: u8 = 0;
         let mut completed_pv: Vec<Move> = Vec::new();
+        let mut prev_score: i32 = 0;
 
         for depth in 1..=max_depth {
             if control.should_stop_iterating() {
                 break;
             }
 
-            let score = negamax(board, depth, 0, -INF, INF, true, &mut ctx);
+            let score = aspiration_search(board, depth, prev_score, &mut ctx);
 
             if control.should_stop(ctx.nodes) {
                 break;
             }
+
+            prev_score = score;
 
             let pv = ctx.pv.root_pv();
             if !pv.is_empty() && !pv[0].is_null() {
@@ -181,23 +187,28 @@ impl ThreadPool {
             tt: &self.tt,
             pv: PvTable::new(),
             control,
+            killers: KillerTable::new(),
+            history: HistoryTable::new(),
         };
 
         let mut completed_move = Move::NULL;
         let mut completed_score = -INF;
         let mut completed_depth: u8 = 0;
         let mut completed_pv: Vec<Move> = Vec::new();
+        let mut prev_score: i32 = 0;
 
         for depth in 1..=max_depth {
             if control.should_stop_iterating() {
                 break;
             }
 
-            let score = negamax(board, depth, 0, -INF, INF, true, &mut ctx);
+            let score = aspiration_search(board, depth, prev_score, &mut ctx);
 
             if control.should_stop(ctx.nodes) {
                 break;
             }
+
+            prev_score = score;
 
             let pv = ctx.pv.root_pv();
             if !pv.is_empty() && !pv[0].is_null() {
@@ -247,22 +258,28 @@ fn run_helper(
         tt,
         pv: PvTable::new(),
         control,
+        killers: KillerTable::new(),
+        history: HistoryTable::new(),
     };
 
     // Depth offset: helpers start at different depths to increase search divergence.
     // Helper i starts at depth 1 + (i % 2), so odd helpers skip depth 1.
     let start_depth: u8 = 1 + (thread_id % 2) as u8;
 
+    let mut prev_score: i32 = 0;
+
     for depth in start_depth..=max_depth {
         if control.should_stop_iterating() {
             break;
         }
 
-        negamax(board, depth, 0, -INF, INF, true, &mut ctx);
+        let score = aspiration_search(board, depth, prev_score, &mut ctx);
 
         if control.should_stop(ctx.nodes) {
             break;
         }
+
+        prev_score = score;
     }
 
     node_counter.store(ctx.nodes, Ordering::Relaxed);

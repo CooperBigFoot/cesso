@@ -11,7 +11,7 @@ use cesso_core::{Board, Move, generate_legal_moves};
 
 use control::SearchControl;
 use heuristics::{HistoryTable, KillerTable};
-use negamax::{INF, PvTable, SearchContext, negamax};
+use negamax::{INF, PvTable, SearchContext, aspiration_search};
 use tt::TranspositionTable;
 
 /// Result of a completed search.
@@ -84,6 +84,7 @@ impl Searcher {
         let mut completed_score = -INF;
         let mut completed_depth: u8 = 0;
         let mut completed_pv: Vec<Move> = Vec::new();
+        let mut prev_score: i32 = 0;
 
         for depth in 1..=max_depth {
             // Check soft limit before starting a new iteration
@@ -91,12 +92,14 @@ impl Searcher {
                 break;
             }
 
-            let score = negamax(board, depth, 0, -INF, INF, true, &mut ctx);
+            let score = aspiration_search(board, depth, prev_score, &mut ctx);
 
             // If search was aborted mid-iteration, discard this iteration's result
             if control.should_stop(ctx.nodes) {
                 break;
             }
+
+            prev_score = score;
 
             // This iteration completed successfully — record results
             let pv = ctx.pv.root_pv();
@@ -385,6 +388,30 @@ mod tests {
         let searcher = Searcher::new();
         let result = search_depth(&searcher, &board, 4);
         assert!(!result.best_move.is_null(), "LMR should return legal move from startpos");
+    }
+
+    #[test]
+    fn aspiration_fires_all_depths() {
+        let board = Board::starting_position();
+        let searcher = Searcher::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_infinite(stopped);
+        let mut depths_seen = Vec::new();
+        searcher.search(&board, 6, &control, |depth, _, _, _| {
+            depths_seen.push(depth);
+        });
+        assert_eq!(depths_seen, vec![1, 2, 3, 4, 5, 6], "aspiration should not skip depths");
+    }
+
+    #[test]
+    fn aspiration_mate_score_not_corrupted() {
+        let board: Board = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
+            .parse()
+            .unwrap();
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 6);
+        assert_eq!(result.best_move.to_uci(), "h5f7");
+        assert!(result.score > negamax::MATE_THRESHOLD, "mate score should survive aspiration");
     }
 
     #[test]
