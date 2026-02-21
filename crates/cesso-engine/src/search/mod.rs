@@ -3,6 +3,7 @@
 pub mod control;
 pub mod negamax;
 pub mod ordering;
+pub mod pool;
 pub mod tt;
 
 use cesso_core::{Board, Move, generate_legal_moves};
@@ -42,8 +43,13 @@ impl Searcher {
     }
 
     /// Clear the transposition table (preserving the allocation).
-    pub fn clear_tt(&mut self) {
+    pub fn clear_tt(&self) {
         self.tt.clear();
+    }
+
+    /// Resize the transposition table to the given size in megabytes.
+    pub fn resize_tt(&mut self, mb: usize) {
+        self.tt = TranspositionTable::new(mb);
     }
 
     /// Run iterative-deepening search up to `max_depth`.
@@ -51,7 +57,7 @@ impl Searcher {
     /// Calls `on_iter(depth, score, nodes, pv)` after each completed
     /// iteration, allowing the caller to emit UCI `info` lines.
     pub fn search<F>(
-        &mut self,
+        &self,
         board: &Board,
         max_depth: u8,
         control: &SearchControl,
@@ -64,7 +70,7 @@ impl Searcher {
 
         let mut ctx = SearchContext {
             nodes: 0,
-            tt: &mut self.tt,
+            tt: &self.tt,
             pv: PvTable::new(),
             control,
         };
@@ -145,7 +151,7 @@ mod tests {
 
     use cesso_core::Board;
 
-    fn search_depth(searcher: &mut Searcher, board: &Board, depth: u8) -> SearchResult {
+    fn search_depth(searcher: &Searcher, board: &Board, depth: u8) -> SearchResult {
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
         searcher.search(board, depth, &control, |_, _, _, _| {})
@@ -154,8 +160,8 @@ mod tests {
     #[test]
     fn depth_1_returns_legal_move() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 1);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 1);
         assert!(!result.best_move.is_null(), "should find a move at depth 1");
     }
 
@@ -166,8 +172,8 @@ mod tests {
         let board: Board = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
             .parse()
             .unwrap();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 2);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 2);
         // The best move should be Qxf7# (h5f7)
         assert_eq!(result.best_move.to_uci(), "h5f7");
         // Score should indicate mate
@@ -182,8 +188,8 @@ mod tests {
     fn stalemate_returns_zero() {
         // Black king on a8, white king on c7, white queen on b6 — black to move, stalemate
         let board: Board = "k7/2K5/1Q6/8/8/8/8/8 b - - 0 1".parse().unwrap();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 1);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 1);
         assert_eq!(result.score, 0, "stalemate should score 0");
     }
 
@@ -191,8 +197,8 @@ mod tests {
     fn mated_position_returns_negative() {
         // Black king on h8, white queen on g7, white king on f6 — black to move, checkmated
         let board: Board = "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1".parse().unwrap();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 1);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 1);
         // Black is checkmated, score should be very negative
         assert!(
             result.score < -negamax::MATE_THRESHOLD,
@@ -204,7 +210,7 @@ mod tests {
     #[test]
     fn iterative_deepening_calls_callback() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
+        let searcher = Searcher::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
         let mut depths_seen = Vec::new();
@@ -217,7 +223,7 @@ mod tests {
     #[test]
     fn on_iter_never_emits_null_move() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
+        let searcher = Searcher::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
         searcher.search(&board, 4, &control, |_d, _score, _nodes, pv| {
@@ -231,7 +237,7 @@ mod tests {
     #[test]
     fn repeated_search_no_null_leak() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
+        let searcher = Searcher::new();
         // First search warms the TT
         let stopped1 = Arc::new(AtomicBool::new(false));
         let control1 = SearchControl::new_infinite(stopped1);
@@ -256,8 +262,8 @@ mod tests {
     fn stalemate_result_is_null() {
         // Black king on a8, white king on c7, white queen on b6 — black to move, stalemate
         let board: Board = "k7/2K5/1Q6/8/8/8/8/8 b - - 0 1".parse().unwrap();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 1);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 1);
         assert!(
             result.best_move.is_null(),
             "stalemate should produce null best_move"
@@ -268,8 +274,8 @@ mod tests {
     fn checkmate_result_is_null() {
         // Black king on h8, white queen on g7, white king on f6 — black to move, checkmated
         let board: Board = "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1".parse().unwrap();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 1);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 1);
         assert!(
             result.best_move.is_null(),
             "checkmate should produce null best_move"
@@ -279,8 +285,8 @@ mod tests {
     #[test]
     fn pv_has_multiple_moves_at_depth_4() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 4);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 4);
         assert!(
             result.pv.len() >= 2,
             "PV at depth 4 should have at least 2 moves, got {}",
@@ -291,8 +297,8 @@ mod tests {
     #[test]
     fn ponder_move_available_at_depth_4() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 4);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 4);
         assert!(
             result.ponder_move.is_some(),
             "ponder move should be available at depth 4"
@@ -302,8 +308,8 @@ mod tests {
     #[test]
     fn pv_first_move_matches_best_move() {
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
-        let result = search_depth(&mut searcher, &board, 4);
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 4);
         if !result.pv.is_empty() {
             assert_eq!(
                 result.pv[0], result.best_move,
@@ -318,7 +324,7 @@ mod tests {
         use std::thread;
 
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
+        let searcher = Searcher::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(Arc::clone(&stopped));
 
@@ -344,7 +350,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let board = Board::starting_position();
-        let mut searcher = Searcher::new();
+        let searcher = Searcher::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(Arc::clone(&stopped));
 
@@ -356,7 +362,7 @@ mod tests {
 
         // Now set stop immediately and search to depth 100
         stopped.store(true, Ordering::Release);
-        let mut searcher2 = Searcher::new();
+        let searcher2 = Searcher::new();
         let result = searcher2.search(&board, 100, &control, |_, _, _, _| {});
 
         // With stop set immediately, depth 0 means no iteration completed

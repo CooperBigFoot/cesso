@@ -37,6 +37,19 @@ pub enum UciError {
         value: String,
     },
 
+    /// The `setoption` command is malformed (missing `name` keyword).
+    #[error("malformed setoption command: missing 'name' keyword")]
+    MalformedSetOption,
+
+    /// A `setoption` value could not be parsed.
+    #[error("invalid value for option {name}: {value}")]
+    InvalidOptionValue {
+        /// The option name.
+        name: String,
+        /// The invalid value string.
+        value: String,
+    },
+
     /// An I/O error occurred while reading from stdin.
     #[error("I/O error: {source}")]
     Io {

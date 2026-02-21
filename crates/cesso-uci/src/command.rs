@@ -33,6 +33,17 @@ pub struct GoParams {
     pub ponder: bool,
 }
 
+/// A UCI option sent via `setoption`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UciOption {
+    /// Hash table size in megabytes, clamped to [1, 65536].
+    Hash(u32),
+    /// Number of search threads, clamped to [1, 256].
+    Threads(u16),
+    /// Enable or disable pondering.
+    Ponder(bool),
+}
+
 /// A parsed UCI command.
 #[derive(Debug)]
 pub enum Command {
@@ -46,6 +57,8 @@ pub enum Command {
     Position(Board),
     /// `go` -- start searching with given parameters.
     Go(GoParams),
+    /// `setoption` -- configure an engine option.
+    SetOption(UciOption),
     /// `ponderhit` -- opponent played the expected move during pondering.
     PonderHit,
     /// `stop` -- halt the current search.
@@ -72,6 +85,7 @@ pub fn parse_command(line: &str) -> Result<Command, UciError> {
         "ponderhit" => Ok(Command::PonderHit),
         "position" => parse_position(&tokens[1..]),
         "go" => parse_go(&tokens[1..]),
+        "setoption" => parse_setoption(&tokens[1..]),
         _ => Ok(Command::Unknown(tokens[0].to_string())),
     }
 }
@@ -176,6 +190,81 @@ fn parse_go(tokens: &[&str]) -> Result<Command, UciError> {
     }
 
     Ok(Command::Go(params))
+}
+
+/// Parse the `setoption` command arguments.
+///
+/// Supports: `setoption name <name> [value <value>]` per UCI spec.
+/// Option names are matched case-insensitively. Unknown option names
+/// produce [`Command::Unknown`] (silently ignored per UCI spec).
+///
+/// # Errors
+///
+/// | Condition | Error |
+/// |---|---|
+/// | Missing `name` keyword | [`UciError::MalformedSetOption`] |
+/// | Invalid or missing value | [`UciError::InvalidOptionValue`] |
+fn parse_setoption(tokens: &[&str]) -> Result<Command, UciError> {
+    // Require the "name" keyword as the first token
+    if tokens.is_empty() || tokens[0] != "name" {
+        return Err(UciError::MalformedSetOption);
+    }
+
+    // Collect tokens after "name" until we hit "value" keyword (or end)
+    let rest = &tokens[1..];
+    let value_pos = rest.iter().position(|&t| t == "value");
+
+    let (name_tokens, value_token) = match value_pos {
+        Some(pos) => (&rest[..pos], rest.get(pos + 1).copied()),
+        None => (rest, None),
+    };
+
+    let name = name_tokens.join(" ").to_lowercase();
+
+    match name.as_str() {
+        "hash" => {
+            let raw = value_token.ok_or_else(|| UciError::InvalidOptionValue {
+                name: "Hash".to_string(),
+                value: String::new(),
+            })?;
+            let parsed: u32 = raw.parse().map_err(|_| UciError::InvalidOptionValue {
+                name: "Hash".to_string(),
+                value: raw.to_string(),
+            })?;
+            let clamped = parsed.clamp(1, 65536);
+            Ok(Command::SetOption(UciOption::Hash(clamped)))
+        }
+        "threads" => {
+            let raw = value_token.ok_or_else(|| UciError::InvalidOptionValue {
+                name: "Threads".to_string(),
+                value: String::new(),
+            })?;
+            let parsed: u32 = raw.parse().map_err(|_| UciError::InvalidOptionValue {
+                name: "Threads".to_string(),
+                value: raw.to_string(),
+            })?;
+            let clamped = parsed.clamp(1, 256) as u16;
+            Ok(Command::SetOption(UciOption::Threads(clamped)))
+        }
+        "ponder" => {
+            let raw = value_token.ok_or_else(|| UciError::InvalidOptionValue {
+                name: "Ponder".to_string(),
+                value: String::new(),
+            })?;
+            let enabled = match raw {
+                "true" => true,
+                "false" => false,
+                _ => {
+                    return Err(UciError::InvalidOptionValue {
+                        name: "Ponder".to_string(),
+                        value: raw.to_string(),
+                    });
+                }
+            };
+            Ok(Command::SetOption(UciOption::Ponder(enabled)))
+        }
+        _ => Ok(Command::Unknown(name)),
+    }
 }
 
 /// Parse a millisecond value from a token.
@@ -390,5 +479,74 @@ mod tests {
     #[test]
     fn parse_stop() {
         assert!(matches!(parse_command("stop").unwrap(), Command::Stop));
+    }
+
+    #[test]
+    fn parse_setoption_hash() {
+        let cmd = parse_command("setoption name Hash value 64").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Hash(64))));
+    }
+
+    #[test]
+    fn parse_setoption_threads() {
+        let cmd = parse_command("setoption name Threads value 4").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Threads(4))));
+    }
+
+    #[test]
+    fn parse_setoption_ponder_true() {
+        let cmd = parse_command("setoption name Ponder value true").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Ponder(true))));
+    }
+
+    #[test]
+    fn parse_setoption_ponder_false() {
+        let cmd = parse_command("setoption name Ponder value false").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Ponder(false))));
+    }
+
+    #[test]
+    fn parse_setoption_case_insensitive() {
+        let cmd = parse_command("setoption name hash value 32").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Hash(32))));
+    }
+
+    #[test]
+    fn parse_setoption_hash_clamped_zero() {
+        let cmd = parse_command("setoption name Hash value 0").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Hash(1))));
+    }
+
+    #[test]
+    fn parse_setoption_hash_clamped_max() {
+        let cmd = parse_command("setoption name Hash value 99999").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Hash(65536))));
+    }
+
+    #[test]
+    fn parse_setoption_threads_clamped() {
+        let cmd_zero = parse_command("setoption name Threads value 0").unwrap();
+        assert!(matches!(cmd_zero, Command::SetOption(UciOption::Threads(1))));
+
+        let cmd_over = parse_command("setoption name Threads value 999").unwrap();
+        assert!(matches!(cmd_over, Command::SetOption(UciOption::Threads(256))));
+    }
+
+    #[test]
+    fn parse_setoption_unknown_option() {
+        let cmd = parse_command("setoption name FooBar value 42").unwrap();
+        assert!(matches!(cmd, Command::Unknown(_)));
+    }
+
+    #[test]
+    fn parse_setoption_missing_name() {
+        let result = parse_command("setoption");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_setoption_invalid_hash_value() {
+        let result = parse_command("setoption name Hash value abc");
+        assert!(result.is_err());
     }
 }

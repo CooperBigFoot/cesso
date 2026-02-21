@@ -1,6 +1,43 @@
-//! Transposition table with bounded-depth replacement.
+//! Lockless transposition table using atomic XOR-based torn-write detection.
+//!
+//! Two `AtomicU64` words per entry (16 bytes, one cache line per pair).
+//!
+//! ## Bit layout
+//!
+//! ```text
+//! word0 (AtomicU64):
+//!   bits 63-32: key           (upper 32 bits of Zobrist hash)
+//!   bits 31-26: generation    (6 bits, wraps at 64)
+//!   bits 25-24: bound         (2 bits)
+//!   bits 23-16: depth         (8 bits)
+//!   bits 15-0:  move          (16 bits)
+//!
+//! word1 (AtomicU64):
+//!   bits 63-32: check         = key XOR (word0 & 0xFFFF_FFFF)
+//!   bits 31-16: score         (i16 as u16)
+//!   bits 15-0:  eval          (i16 as u16)
+//! ```
+//!
+//! ## Torn-write detection
+//!
+//! On probe: `check_expected = (w0 >> 32) ^ (w0 & 0xFFFF_FFFF)`.
+//! If `check_expected != (w1 >> 32)` the entry was written by another thread
+//! mid-write and we return `None` rather than using garbage data.
+//!
+//! All atomic accesses use `Relaxed` ordering — the standard Stockfish technique.
+
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use cesso_core::Move;
+
+// ── Compile-time assertion: TT must be Send + Sync for Lazy SMP ─────────────
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn check() {
+        assert_send_sync::<TranspositionTable>();
+    }
+    let _ = check;
+};
 
 /// Bound type stored in a TT entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,66 +66,6 @@ impl Bound {
 
 /// Scores above this threshold indicate a forced mate.
 const MATE_THRESHOLD: i32 = 28_000;
-
-/// A single transposition table entry — exactly 16 bytes.
-///
-/// Layout:
-/// - `key`: upper 32 bits of the Zobrist hash (for collision detection)
-/// - `data`: packed bits — move(16) | depth(8) | bound(2) | generation(6)
-/// - `score`: mate-adjusted search score
-/// - `eval`: static evaluation (for future pruning techniques)
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct TtEntry {
-    key: u32,
-    data: u32,
-    score: i16,
-    eval: i16,
-    _padding: u32,
-}
-
-impl Default for TtEntry {
-    fn default() -> Self {
-        Self {
-            key: 0,
-            data: 0,
-            score: 0,
-            eval: 0,
-            _padding: 0,
-        }
-    }
-}
-
-impl TtEntry {
-    /// Pack data fields into the `data` u32.
-    fn pack_data(mv: Move, depth: u8, bound: Bound, generation: u8) -> u32 {
-        let mv_bits = mv.raw() as u32;
-        let depth_bits = (depth as u32) << 16;
-        let bound_bits = ((bound as u8) as u32) << 24;
-        let gen_bits = ((generation & 0x3F) as u32) << 26;
-        mv_bits | depth_bits | bound_bits | gen_bits
-    }
-
-    /// Extract the best move from the packed data.
-    fn move_bits(&self) -> Move {
-        Move::from_raw((self.data & 0xFFFF) as u16)
-    }
-
-    /// Extract the search depth from the packed data.
-    fn depth(&self) -> u8 {
-        ((self.data >> 16) & 0xFF) as u8
-    }
-
-    /// Extract the bound type from the packed data.
-    fn bound(&self) -> Bound {
-        Bound::from_bits(((self.data >> 24) & 0x03) as u8)
-    }
-
-    /// Extract the generation counter from the packed data.
-    fn generation(&self) -> u8 {
-        ((self.data >> 26) & 0x3F) as u8
-    }
-}
 
 /// Result of a successful TT probe.
 #[derive(Debug, Clone)]
@@ -135,11 +112,108 @@ pub fn score_from_tt(score: i16, ply: u8) -> i32 {
     }
 }
 
-/// Fixed-size transposition table with generation-based replacement.
+// ── Internal entry type ──────────────────────────────────────────────────────
+
+/// Two 64-bit atomic words — one logical TT slot.
+struct AtomicEntry {
+    word0: AtomicU64,
+    word1: AtomicU64,
+}
+
+impl AtomicEntry {
+    const fn new() -> Self {
+        Self {
+            word0: AtomicU64::new(0),
+            word1: AtomicU64::new(0),
+        }
+    }
+
+    /// Pack fields into word0.
+    ///
+    /// Layout:
+    ///   [63:32] key | [31:26] generation | [25:24] bound | [23:16] depth | [15:0] mv
+    fn pack_word0(key32: u32, generation: u8, bound: Bound, depth: u8, mv: Move) -> u64 {
+        let key_bits = (key32 as u64) << 32;
+        let gen_bits = ((generation & 0x3F) as u64) << 26;
+        let bound_bits = ((bound as u8) as u64) << 24;
+        let depth_bits = (depth as u64) << 16;
+        let mv_bits = mv.raw() as u64;
+        key_bits | gen_bits | bound_bits | depth_bits | mv_bits
+    }
+
+    /// Pack fields into word1.
+    ///
+    /// Layout:
+    ///   [63:32] check (key XOR lower32 of word0) | [31:16] score | [15:0] eval
+    fn pack_word1(w0: u64, score: i16, eval: i16) -> u64 {
+        let key32 = (w0 >> 32) as u32;
+        let data_lower = (w0 & 0xFFFF_FFFF) as u32;
+        let check = (key32 ^ data_lower) as u64;
+        let check_bits = check << 32;
+        let score_bits = ((score as u16) as u64) << 16;
+        let eval_bits = (eval as u16) as u64;
+        check_bits | score_bits | eval_bits
+    }
+
+    /// Decode `word0` into its fields.
+    fn decode_w0(w0: u64) -> (u32, u8, Bound, u8, Move) {
+        let key32 = (w0 >> 32) as u32;
+        let generation = ((w0 >> 26) & 0x3F) as u8;
+        let bound = Bound::from_bits(((w0 >> 24) & 0x03) as u8);
+        let depth = ((w0 >> 16) & 0xFF) as u8;
+        let mv = Move::from_raw((w0 & 0xFFFF) as u16);
+        (key32, generation, bound, depth, mv)
+    }
+
+    /// Load and verify the entry for `hash`.
+    ///
+    /// Returns `None` if the key does not match or the XOR check detects a torn write.
+    fn load(&self, hash: u64) -> Option<(u8, Bound, u8, Move, u64, u64)> {
+        let w0 = self.word0.load(Ordering::Relaxed);
+        let w1 = self.word1.load(Ordering::Relaxed);
+
+        // XOR integrity check: detect torn writes from concurrent threads
+        let key32_w0 = (w0 >> 32) as u32;
+        let data_lower = (w0 & 0xFFFF_FFFF) as u32;
+        let check_expected = key32_w0 ^ data_lower;
+        let check_stored = (w1 >> 32) as u32;
+        if check_expected != check_stored {
+            return None;
+        }
+
+        // Key collision check
+        let key32 = (hash >> 32) as u32;
+        if key32_w0 != key32 {
+            return None;
+        }
+
+        let (_, generation, bound, depth, mv) = Self::decode_w0(w0);
+        Some((generation, bound, depth, mv, w0, w1))
+    }
+
+    /// Store an entry atomically (word0 first, then word1).
+    fn store(&self, w0: u64, w1: u64) {
+        self.word0.store(w0, Ordering::Relaxed);
+        self.word1.store(w1, Ordering::Relaxed);
+    }
+
+    /// Load word0 for replacement-policy inspection (no key check).
+    fn peek_w0(&self) -> u64 {
+        self.word0.load(Ordering::Relaxed)
+    }
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Lockless transposition table with atomic XOR integrity checking.
+///
+/// All method receivers are `&self` — the table is safe to share across threads.
 pub struct TranspositionTable {
-    entries: Box<[TtEntry]>,
-    mask: u32,
-    generation: u8,
+    entries: Box<[AtomicEntry]>,
+    /// Index mask — `num_entries - 1` (power-of-two allocation).
+    mask: u64,
+    /// Current search generation (wraps every 64 searches).
+    generation: AtomicU8,
 }
 
 impl TranspositionTable {
@@ -148,60 +222,72 @@ impl TranspositionTable {
     /// The actual number of entries is rounded down to the nearest power of two.
     pub fn new(mb: usize) -> Self {
         let bytes = mb * 1024 * 1024;
-        let entry_size = std::mem::size_of::<TtEntry>();
-        let num_entries = (bytes / entry_size).next_power_of_two() >> 1; // round down
-        let num_entries = num_entries.max(1); // at least 1 entry
+        let entry_size = std::mem::size_of::<AtomicEntry>();
+        let num_entries = (bytes / entry_size).next_power_of_two() >> 1;
+        let num_entries = num_entries.max(1);
+
+        let entries: Box<[AtomicEntry]> = (0..num_entries)
+            .map(|_| AtomicEntry::new())
+            .collect();
 
         Self {
-            entries: vec![TtEntry::default(); num_entries].into_boxed_slice(),
-            mask: (num_entries - 1) as u32,
-            generation: 0,
+            entries,
+            mask: (num_entries - 1) as u64,
+            generation: AtomicU8::new(0),
         }
     }
 
-    /// Clear all entries.
-    pub fn clear(&mut self) {
-        self.entries.fill(TtEntry::default());
-        self.generation = 0;
+    /// Clear all entries and reset the generation counter.
+    pub fn clear(&self) {
+        for entry in self.entries.iter() {
+            entry.word0.store(0, Ordering::Relaxed);
+            entry.word1.store(0, Ordering::Relaxed);
+        }
+        self.generation.store(0, Ordering::Relaxed);
     }
 
     /// Advance the generation counter. Call once per `go` command.
-    pub fn new_generation(&mut self) {
-        self.generation = self.generation.wrapping_add(1) & 0x3F;
+    pub fn new_generation(&self) {
+        let current = self.generation.load(Ordering::Relaxed);
+        self.generation
+            .store(current.wrapping_add(1) & 0x3F, Ordering::Relaxed);
     }
 
     /// Probe the table for a position.
     ///
-    /// Returns `Some(TtProbeResult)` if a matching entry is found,
-    /// with the score adjusted back from TT-relative to root-relative
-    /// using the given `ply`.
+    /// Returns `Some(TtProbeResult)` if a matching, intact entry is found.
+    /// Returns `None` on a miss, key mismatch, or torn-write detection.
     pub fn probe(&self, hash: u64, ply: u8) -> Option<TtProbeResult> {
-        let index = (hash as u32 & self.mask) as usize;
+        let index = (hash & self.mask) as usize;
         let entry = &self.entries[index];
 
-        // Verify the upper 32 bits match to reduce collisions
-        let key32 = (hash >> 32) as u32;
-        if entry.key != key32 || entry.bound() == Bound::None {
+        let (_, bound, depth, mv, _w0, w1) = entry.load(hash)?;
+
+        if bound == Bound::None {
             return None;
         }
 
+        let score_raw = ((w1 >> 16) & 0xFFFF) as u16 as i16;
+        let eval_raw = (w1 & 0xFFFF) as u16 as i16;
+
         Some(TtProbeResult {
-            best_move: entry.move_bits(),
-            depth: entry.depth(),
-            bound: entry.bound(),
-            score: score_from_tt(entry.score, ply),
-            eval: entry.eval as i32,
+            best_move: mv,
+            depth,
+            bound,
+            score: score_from_tt(score_raw, ply),
+            eval: eval_raw as i32,
         })
     }
 
     /// Store a position in the table.
     ///
-    /// Replacement policy: always replace if:
-    /// - The entry is from an older generation, OR
-    /// - The new depth >= stored depth, OR
+    /// Replacement policy: replace if any of:
+    /// - The slot is empty (bound is None)
+    /// - The stored entry is from a different generation
+    /// - The new depth >= stored depth
     /// - The new bound is Exact
     pub fn store(
-        &mut self,
+        &self,
         hash: u64,
         depth: u8,
         score: i32,
@@ -210,27 +296,28 @@ impl TranspositionTable {
         bound: Bound,
         ply: u8,
     ) {
-        let index = (hash as u32 & self.mask) as usize;
-        let key32 = (hash >> 32) as u32;
-        let existing = &self.entries[index];
+        let index = (hash & self.mask) as usize;
+        let entry = &self.entries[index];
+        let generation = self.generation.load(Ordering::Relaxed);
 
-        // Replacement policy
-        let dominated = existing.bound() == Bound::None
-            || existing.generation() != self.generation
-            || depth >= existing.depth()
+        // Replacement policy — inspect existing entry without key check
+        let existing_w0 = entry.peek_w0();
+        let (_, existing_generation, existing_bound, existing_depth, _) =
+            AtomicEntry::decode_w0(existing_w0);
+
+        let dominated = existing_bound == Bound::None
+            || existing_generation != generation
+            || depth >= existing_depth
             || bound == Bound::Exact;
 
         if !dominated {
             return;
         }
 
-        self.entries[index] = TtEntry {
-            key: key32,
-            data: TtEntry::pack_data(best_move, depth, bound, self.generation),
-            score: score_to_tt(score, ply),
-            eval: eval as i16,
-            _padding: 0,
-        };
+        let key32 = (hash >> 32) as u32;
+        let w0 = AtomicEntry::pack_word0(key32, generation, bound, depth, best_move);
+        let w1 = AtomicEntry::pack_word1(w0, score_to_tt(score, ply), eval as i16);
+        entry.store(w0, w1);
     }
 }
 
@@ -238,10 +325,12 @@ impl std::fmt::Debug for TranspositionTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TranspositionTable")
             .field("entries", &self.entries.len())
-            .field("generation", &self.generation)
+            .field("generation", &self.generation.load(Ordering::Relaxed))
             .finish()
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -249,13 +338,13 @@ mod tests {
     use cesso_core::{Move, Square};
 
     #[test]
-    fn entry_is_16_bytes() {
-        assert_eq!(std::mem::size_of::<TtEntry>(), 16);
+    fn atomic_entry_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<AtomicEntry>(), 16);
     }
 
     #[test]
     fn store_and_probe_roundtrip() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let hash: u64 = 0xDEAD_BEEF_1234_5678;
         let mv = Move::new(Square::E2, Square::E4);
 
@@ -281,9 +370,7 @@ mod tests {
         let mate_score = 29_000 - 3;
         let ply: u8 = 5;
 
-        // Store at ply 5: should add ply to make it distance-from-node
         let tt_score = score_to_tt(mate_score, ply);
-        // Retrieve at ply 5: should subtract ply to get back distance-from-root
         let restored = score_from_tt(tt_score, ply);
         assert_eq!(restored, mate_score);
     }
@@ -301,7 +388,7 @@ mod tests {
 
     #[test]
     fn normal_score_not_adjusted() {
-        let score = 150; // regular centipawn score
+        let score = 150;
         let ply: u8 = 10;
 
         let tt_score = score_to_tt(score, ply);
@@ -311,7 +398,7 @@ mod tests {
 
     #[test]
     fn generation_replacement_policy() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let hash: u64 = 0xAAAA_BBBB_CCCC_DDDD;
         let mv1 = Move::new(Square::E2, Square::E4);
         let mv2 = Move::new(Square::D2, Square::D4);
@@ -322,7 +409,7 @@ mod tests {
         // Advance generation
         tt.new_generation();
 
-        // Store at depth 1 in generation 1 — should replace because different generation
+        // Store at depth 1 in generation 1 — should replace (different generation)
         tt.store(hash, 1, 200, 60, mv2, Bound::LowerBound, 0);
 
         let result = tt.probe(hash, 0).unwrap();
@@ -332,7 +419,7 @@ mod tests {
 
     #[test]
     fn depth_replacement_policy() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let hash: u64 = 0x1111_2222_3333_4444;
         let mv1 = Move::new(Square::E2, Square::E4);
         let mv2 = Move::new(Square::D2, Square::D4);
@@ -349,7 +436,7 @@ mod tests {
 
     #[test]
     fn clear_removes_all_entries() {
-        let mut tt = TranspositionTable::new(1);
+        let tt = TranspositionTable::new(1);
         let hash: u64 = 0xAAAA_BBBB_CCCC_DDDD;
         let mv = Move::new(Square::E2, Square::E4);
 
@@ -358,5 +445,52 @@ mod tests {
 
         tt.clear();
         assert!(tt.probe(hash, 0).is_none());
+    }
+
+    #[test]
+    fn xor_integrity_detects_torn_write() {
+        let tt = TranspositionTable::new(1);
+        let hash: u64 = 0xDEAD_BEEF_1234_5678;
+        let mv = Move::new(Square::E2, Square::E4);
+
+        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0);
+        assert!(tt.probe(hash, 0).is_some(), "entry should be found before corruption");
+
+        // Corrupt the check bits in word1 to simulate a torn write
+        let index = (hash & tt.mask) as usize;
+        let entry = &tt.entries[index];
+        let w1 = entry.word1.load(Ordering::Relaxed);
+        // Flip all bits in the check field (upper 32 bits of word1)
+        let corrupted_w1 = w1 ^ 0xFFFF_FFFF_0000_0000;
+        entry.word1.store(corrupted_w1, Ordering::Relaxed);
+
+        assert!(
+            tt.probe(hash, 0).is_none(),
+            "probe should return None after XOR corruption"
+        );
+    }
+
+    #[test]
+    fn concurrent_stress_no_panics() {
+        use std::thread;
+
+        let tt = std::sync::Arc::new(TranspositionTable::new(4));
+
+        thread::scope(|s| {
+            for t in 0..8u64 {
+                let tt = std::sync::Arc::clone(&tt);
+                s.spawn(move || {
+                    let mv = Move::new(Square::E2, Square::E4);
+                    for i in 0u64..10_000 {
+                        // Mix of different hashes so threads collide on some entries
+                        let hash = (t.wrapping_mul(6364136223846793005))
+                            .wrapping_add(i.wrapping_mul(2862933555777941757))
+                            ^ 0xDEAD_BEEF_CAFE_F00D;
+                        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0);
+                        let _ = tt.probe(hash, 0);
+                    }
+                });
+            }
+        });
     }
 }

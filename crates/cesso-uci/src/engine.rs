@@ -7,10 +7,27 @@ use std::sync::{Arc, mpsc};
 use tracing::{debug, info, warn};
 
 use cesso_core::Board;
-use cesso_engine::{SearchControl, SearchResult, Searcher, limits_from_go};
+use cesso_engine::{SearchControl, SearchResult, ThreadPool, limits_from_go};
 
-use crate::command::{GoParams, parse_command, Command};
+use crate::command::{GoParams, UciOption, parse_command, Command};
 use crate::error::UciError;
+
+/// Configuration knobs adjustable via `setoption`.
+struct EngineConfig {
+    /// Transposition table size in megabytes.
+    hash_mb: u32,
+    /// Number of search threads.
+    threads: u16,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            hash_mb: 16,
+            threads: 1,
+        }
+    }
+}
 
 /// Internal engine state — tracks whether the engine is idle, searching, or pondering.
 enum EngineState {
@@ -29,20 +46,23 @@ enum EngineEvent {
 /// Payload returned by the search thread when it finishes.
 struct SearchDone {
     result: SearchResult,
-    searcher: Searcher,
+    pool: ThreadPool,
 }
 
-/// The UCI engine, holding current board state and searcher.
+/// The UCI engine, holding current board state and thread pool.
 ///
 /// Runs an event-driven loop on the main thread, dispatching searches
 /// to a worker thread and processing UCI commands concurrently.
 pub struct UciEngine {
     board: Board,
-    searcher: Option<Searcher>,
+    pool: Option<ThreadPool>,
     state: EngineState,
     stop_flag: Arc<AtomicBool>,
     control: Option<Arc<SearchControl>>,
+    config: EngineConfig,
     pending_clear_tt: bool,
+    /// Pending TT resize (MB) to apply when the search thread returns the pool.
+    pending_resize_tt: Option<u32>,
 }
 
 impl UciEngine {
@@ -50,11 +70,13 @@ impl UciEngine {
     pub fn new() -> Self {
         Self {
             board: Board::starting_position(),
-            searcher: Some(Searcher::new()),
+            pool: Some(ThreadPool::new(16)),
             state: EngineState::Idle,
             stop_flag: Arc::new(AtomicBool::new(false)),
             control: None,
+            config: EngineConfig::default(),
             pending_clear_tt: false,
+            pending_resize_tt: None,
         }
     }
 
@@ -97,6 +119,7 @@ impl UciEngine {
                     Command::UciNewGame => self.handle_ucinewgame(),
                     Command::Position(board) => self.handle_position(board),
                     Command::Go(params) => self.handle_go(params, &tx),
+                    Command::SetOption(opt) => self.handle_setoption(opt),
                     Command::PonderHit => self.handle_ponderhit(),
                     Command::Stop => self.handle_stop(),
                     Command::Quit => {
@@ -132,6 +155,8 @@ impl UciEngine {
     fn handle_uci(&self) {
         println!("id name cesso");
         println!("id author Nicolas Lazaro");
+        println!("option name Hash type spin default 16 min 1 max 65536");
+        println!("option name Threads type spin default 1 min 1 max 256");
         println!("option name Ponder type check default false");
         println!("uciok");
     }
@@ -142,11 +167,33 @@ impl UciEngine {
 
     fn handle_ucinewgame(&mut self) {
         self.board = Board::starting_position();
-        if let Some(ref mut searcher) = self.searcher {
-            searcher.clear_tt();
+        if let Some(ref pool) = self.pool {
+            pool.clear_tt();
         } else {
-            // Search thread owns the searcher — defer clear until it comes back
+            // Search thread owns the pool — defer clear until it comes back
             self.pending_clear_tt = true;
+        }
+    }
+
+    fn handle_setoption(&mut self, option: UciOption) {
+        match option {
+            UciOption::Hash(mb) => {
+                self.config.hash_mb = mb;
+                if let Some(ref mut pool) = self.pool {
+                    pool.resize_tt(mb as usize);
+                } else {
+                    self.pending_resize_tt = Some(mb);
+                }
+            }
+            UciOption::Threads(threads) => {
+                self.config.threads = threads;
+                if let Some(ref mut pool) = self.pool {
+                    pool.set_num_threads(threads as usize);
+                }
+            }
+            UciOption::Ponder(_) => {
+                // Ponder option acknowledged — actual pondering is handled by the go ponder protocol
+            }
         }
     }
 
@@ -179,33 +226,32 @@ impl UciEngine {
 
         let max_depth = params.depth.unwrap_or(128);
 
-        // Take the searcher — the search thread will own it
-        let mut searcher = self.searcher.take().unwrap_or_default();
+        // Take the pool — the search thread will own it
+        let pool = self.pool.take().unwrap_or_default();
 
         let board = self.board;
         let search_control = Arc::clone(&control);
         let tx = tx.clone();
 
         std::thread::spawn(move || {
-            let result =
-                searcher.search(&board, max_depth, &search_control, |d, score, nodes, pv| {
-                    let elapsed = search_control.elapsed();
-                    let elapsed_ms = elapsed.as_millis().max(1);
-                    let nps = (nodes as u128 * 1000) / elapsed_ms;
+            let result = pool.search(&board, max_depth, &search_control, |d, score, nodes, pv| {
+                let elapsed = search_control.elapsed();
+                let elapsed_ms = elapsed.as_millis().max(1);
+                let nps = (nodes as u128 * 1000) / elapsed_ms;
 
-                    let pv_str: String = pv
-                        .iter()
-                        .filter(|m| !m.is_null())
-                        .map(|m| m.to_uci())
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                let pv_str: String = pv
+                    .iter()
+                    .filter(|m| !m.is_null())
+                    .map(|m| m.to_uci())
+                    .collect::<Vec<_>>()
+                    .join(" ");
 
-                    println!(
-                        "info depth {} score cp {} nodes {} nps {} time {} pv {}",
-                        d, score, nodes, nps, elapsed_ms, pv_str
-                    );
-                });
-            let _ = tx.send(EngineEvent::SearchDone(SearchDone { result, searcher }));
+                println!(
+                    "info depth {} score cp {} nodes {} nps {} time {} pv {}",
+                    d, score, nodes, nps, elapsed_ms, pv_str
+                );
+            });
+            let _ = tx.send(EngineEvent::SearchDone(SearchDone { result, pool }));
         });
 
         self.state = if params.ponder {
@@ -232,14 +278,18 @@ impl UciEngine {
     }
 
     fn finish_search(&mut self, done: SearchDone) {
-        let mut searcher = done.searcher;
+        let mut pool = done.pool;
 
-        if self.pending_clear_tt {
-            searcher.clear_tt();
+        if let Some(mb) = self.pending_resize_tt.take() {
+            // Resize supersedes clear — a fresh allocation is already empty
+            pool.resize_tt(mb as usize);
+            self.pending_clear_tt = false;
+        } else if self.pending_clear_tt {
+            pool.clear_tt();
             self.pending_clear_tt = false;
         }
 
-        self.searcher = Some(searcher);
+        self.pool = Some(pool);
         self.control = None;
 
         let result = &done.result;

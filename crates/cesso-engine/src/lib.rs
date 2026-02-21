@@ -7,5 +7,6 @@ pub(crate) mod book;
 
 pub use eval::evaluate;
 pub use search::control::SearchControl;
+pub use search::pool::ThreadPool;
 pub use search::{SearchResult, Searcher};
 pub use time::limits_from_go;

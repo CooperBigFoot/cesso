@@ -265,12 +265,12 @@ impl Default for PvTable {
     }
 }
 
-/// Mutable search state threaded through negamax calls.
+/// Search state threaded through negamax calls.
 pub(super) struct SearchContext<'a> {
     /// Total nodes visited.
     pub nodes: u64,
-    /// Transposition table.
-    pub tt: &'a mut TranspositionTable,
+    /// Transposition table (shared, lockless).
+    pub tt: &'a TranspositionTable,
     /// Principal variation table.
     pub pv: PvTable,
     /// Search control (stop flag + time limits).
