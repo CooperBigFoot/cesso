@@ -1,9 +1,10 @@
 //! Negamax alpha-beta search with quiescence.
 
-use cesso_core::{Board, Move, generate_legal_moves};
+use cesso_core::{Board, Move, MoveKind, generate_legal_moves};
 
 use crate::evaluate;
 use crate::search::control::SearchControl;
+use crate::search::heuristics::{HistoryTable, KillerTable};
 use crate::search::ordering::MovePicker;
 use crate::search::tt::{Bound, TranspositionTable};
 
@@ -100,10 +101,12 @@ pub(super) fn negamax(
 
     let moves = generate_legal_moves(board);
 
+    // Detect check once — used for stalemate/checkmate and LMR guard
+    let king_sq = board.king_square(board.side_to_move());
+    let in_check = board.is_square_attacked(king_sq, !board.side_to_move());
+
     // No legal moves: checkmate or stalemate
     if moves.is_empty() {
-        let king_sq = board.king_square(board.side_to_move());
-        let in_check = board.is_square_attacked(king_sq, !board.side_to_move());
         return if in_check {
             -(MATE_SCORE - ply as i32)
         } else {
@@ -114,11 +117,41 @@ pub(super) fn negamax(
     let original_alpha = alpha;
     let mut best_score = -INF;
     let mut best_move = Move::NULL;
-    let mut picker = MovePicker::new(&moves, board, tt_move);
+    let mut picker = MovePicker::new(&moves, board, tt_move, &ctx.killers, &ctx.history, ply as usize);
+    let mut searched_quiets = [Move::NULL; 64];
+    let mut quiet_count: usize = 0;
+    let mut move_count: usize = 0;
 
     while let Some(mv) = picker.pick_next() {
+        // Track quiet moves for history penalty on cutoff
+        let is_quiet_move = mv.kind() == MoveKind::Normal && board.piece_on(mv.dest()).is_none();
+        if is_quiet_move && quiet_count < 64 {
+            searched_quiets[quiet_count] = mv;
+            quiet_count += 1;
+        }
+
         let child = board.make_move(mv);
-        let score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+        move_count += 1;
+
+        // --- Late Move Reductions (LMR) ---
+        let is_tactical = board.piece_on(mv.dest()).is_some()
+            || mv.kind() == MoveKind::EnPassant
+            || mv.kind() == MoveKind::Promotion;
+
+        let mut score;
+        if depth >= 3 && move_count >= 4 && !is_tactical && !in_check {
+            let r: u8 = if move_count >= 7 { 2 } else { 1 };
+            let reduced_depth = depth.saturating_sub(1 + r);
+            // Reduced-depth search with full window
+            score = -negamax(&child, reduced_depth, ply + 1, -beta, -alpha, true, ctx);
+
+            // Re-search at full depth if the reduced search improved alpha
+            if score > alpha {
+                score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+            }
+        } else {
+            score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+        }
 
         if score > best_score {
             best_score = score;
@@ -130,6 +163,21 @@ pub(super) fn negamax(
         }
 
         if alpha >= beta {
+            // Update killer and history for quiet moves that cause cutoffs
+            let is_quiet = mv.kind() == MoveKind::Normal && board.piece_on(mv.dest()).is_none();
+            if is_quiet {
+                ctx.killers.store(ply as usize, mv);
+                if let Some(piece) = board.piece_on(mv.source()) {
+                    ctx.history.update_good(piece, mv.dest().index(), depth);
+                    // Penalise all quiet moves searched before the cutoff move
+                    for i in 0..quiet_count {
+                        let bad_mv = searched_quiets[i];
+                        if let Some(bad_piece) = board.piece_on(bad_mv.source()) {
+                            ctx.history.update_bad(bad_piece, bad_mv.dest().index(), depth);
+                        }
+                    }
+                }
+            }
             break;
         }
     }
@@ -298,4 +346,8 @@ pub(super) struct SearchContext<'a> {
     pub pv: PvTable,
     /// Search control (stop flag + time limits).
     pub control: &'a SearchControl,
+    /// Killer move table.
+    pub killers: KillerTable,
+    /// History heuristic table.
+    pub history: HistoryTable,
 }

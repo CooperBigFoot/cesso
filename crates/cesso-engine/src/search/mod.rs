@@ -1,6 +1,7 @@
 //! Search algorithms and move ordering.
 
 pub mod control;
+pub mod heuristics;
 pub mod negamax;
 pub mod ordering;
 pub mod pool;
@@ -9,6 +10,7 @@ pub mod tt;
 use cesso_core::{Board, Move, generate_legal_moves};
 
 use control::SearchControl;
+use heuristics::{HistoryTable, KillerTable};
 use negamax::{INF, PvTable, SearchContext, negamax};
 use tt::TranspositionTable;
 
@@ -73,6 +75,8 @@ impl Searcher {
             tt: &self.tt,
             pv: PvTable::new(),
             control,
+            killers: KillerTable::new(),
+            history: HistoryTable::new(),
         };
 
         // Track completed iteration results (for abort-safety)
@@ -362,6 +366,25 @@ mod tests {
         let searcher = Searcher::new();
         let result = search_depth(&searcher, &board, 4);
         assert_eq!(result.score, 0, "stalemate should still return 0 with NMP");
+    }
+
+    #[test]
+    fn lmr_still_finds_mate_in_one() {
+        let board: Board = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
+            .parse()
+            .unwrap();
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 5);
+        assert_eq!(result.best_move.to_uci(), "h5f7", "LMR should not break mate-in-one");
+        assert!(result.score > negamax::MATE_THRESHOLD);
+    }
+
+    #[test]
+    fn lmr_startpos_depth4_legal_move() {
+        let board = Board::starting_position();
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 4);
+        assert!(!result.best_move.is_null(), "LMR should return legal move from startpos");
     }
 
     #[test]
