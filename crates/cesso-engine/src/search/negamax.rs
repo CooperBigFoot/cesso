@@ -71,16 +71,11 @@ pub(super) fn negamax(
                 Bound::UpperBound => tt_entry.score <= alpha,
                 Bound::None => false,
             };
-            if cutoff {
-                if ply == 0 {
-                    if !tt_entry.best_move.is_null() {
-                        ctx.pv.set_single(0, tt_entry.best_move);
-                        return tt_entry.score;
-                    }
-                    // No valid move in TT entry — fall through to search
-                } else {
-                    return tt_entry.score;
-                }
+            // Never cut off at the root — always search so the PV and
+            // score reflect the current iteration's work.  The TT move
+            // is still used for move ordering above.
+            if cutoff && ply > 0 {
+                return tt_entry.score;
             }
         }
     }
@@ -97,7 +92,7 @@ pub(super) fn negamax(
         if !in_check {
             let r = if depth >= 6 { 3 } else { 2 };
             let null_board = board.make_null_move();
-            ctx.history.push(null_board.hash());
+            ctx.history.push(board.hash());
             let null_score = -negamax(
                 &null_board,
                 depth.saturating_sub(1 + r),
@@ -148,8 +143,10 @@ pub(super) fn negamax(
         let child = board.make_move(mv);
         move_count += 1;
 
-        // Push child position hash for repetition detection
-        ctx.history.push(child.hash());
+        // Push current position hash so the child can detect repetitions
+        // with ancestor positions (must NOT push child.hash() — the child
+        // would immediately match itself).
+        ctx.history.push(board.hash());
 
         // --- Late Move Reductions (LMR) ---
         let is_tactical = board.piece_on(mv.dest()).is_some()
