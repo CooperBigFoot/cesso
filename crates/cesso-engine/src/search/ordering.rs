@@ -1,8 +1,9 @@
-//! Move ordering via MVV-LVA (Most Valuable Victim - Least Valuable Attacker).
+//! Move ordering via MVV-LVA (Most Valuable Victim - Least Valuable Attacker) and SEE.
 
 use cesso_core::{Board, Move, MoveKind, MoveList, PieceKind, PromotionPiece};
 
 use crate::search::heuristics::{HistoryTable, KillerTable};
+use crate::search::see::see;
 
 /// MVV-LVA scores indexed by `[victim][attacker]`.
 ///
@@ -28,13 +29,14 @@ const MVV_LVA: [[i32; 6]; 6] = [
 /// Higher scores are searched first. Score bands:
 /// - TT move: 10,000 (assigned by MovePicker, not here)
 /// - Killer moves: 5,000
+/// - Good captures (SEE >= 0): 1,007..1,144
 /// - Queen promotion: 200
 /// - Rook promotion: 170
 /// - Bishop/Knight promotion: 160
-/// - Captures (MVV-LVA): 7..144
+/// - Quiet (history-scored): -16384..16384
 /// - En passant: 15
-/// - Quiet (history-scored): -16384..16384 (centered around 0)
 /// - Castling: 1
+/// - Bad captures (SEE < 0): -10,900..-10,001
 fn score_move_full(
     board: &Board,
     mv: Move,
@@ -52,8 +54,15 @@ fn score_move_full(
         MoveKind::Castling => 1,
         MoveKind::Normal => {
             if let Some(victim) = board.piece_on(mv.dest()) {
-                let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
-                MVV_LVA[victim.index()][attacker.index()]
+                let see_score = see(board, mv);
+                if see_score >= 0 {
+                    // Good capture: above quiets but below killers
+                    let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
+                    1_000 + MVV_LVA[victim.index()][attacker.index()]
+                } else {
+                    // Bad capture: below all quiets
+                    -10_000 + see_score
+                }
             } else if killers.is_killer(ply, mv) {
                 5_000
             } else {
@@ -77,8 +86,13 @@ pub fn score_move(board: &Board, mv: Move) -> i32 {
         MoveKind::Castling => 0,
         MoveKind::Normal => {
             if let Some(victim) = board.piece_on(mv.dest()) {
-                let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
-                MVV_LVA[victim.index()][attacker.index()]
+                let see_score = see(board, mv);
+                if see_score >= 0 {
+                    let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
+                    1_000 + MVV_LVA[victim.index()][attacker.index()]
+                } else {
+                    -10_000 + see_score
+                }
             } else {
                 0
             }

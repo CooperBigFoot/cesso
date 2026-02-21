@@ -5,6 +5,7 @@ pub mod heuristics;
 pub mod negamax;
 pub mod ordering;
 pub mod pool;
+pub mod see;
 pub mod tt;
 
 use cesso_core::{Board, Move, generate_legal_moves};

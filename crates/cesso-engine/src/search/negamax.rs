@@ -6,6 +6,7 @@ use crate::evaluate;
 use crate::search::control::SearchControl;
 use crate::search::heuristics::{HistoryTable, KillerTable};
 use crate::search::ordering::MovePicker;
+use crate::search::see::see_ge;
 use crate::search::tt::{Bound, TranspositionTable};
 
 /// Score representing an unreachable upper/lower bound.
@@ -314,6 +315,11 @@ fn qsearch(
     let mut picker = MovePicker::new_qsearch(&moves, board);
 
     while let Some(mv) = picker.pick_next() {
+        // Skip captures with negative SEE (losing exchanges), but never skip promotions.
+        if mv.kind() != MoveKind::Promotion && !see_ge(board, mv, 0) {
+            continue;
+        }
+
         let child = board.make_move(mv);
         let score = -qsearch(&child, ply + 1, -beta, -alpha, ctx);
 
