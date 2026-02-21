@@ -30,6 +30,12 @@ const FUTILITY_MARGIN: [i32; 4] = [0, 200, 450, 700];
 /// Reverse futility pruning margins indexed by depth.
 const RFP_MARGIN: [i32; 4] = [0, 200, 450, 700];
 
+/// Maximum depth for Late Move Pruning.
+const LMP_MAX_DEPTH: u8 = 4;
+
+/// Move count threshold for LMP by depth (formula: 3 + d*d).
+const LMP_THRESHOLD: [usize; 5] = [0, 4, 7, 12, 19];
+
 /// Negamax alpha-beta search.
 ///
 /// Returns the best score for the side to move. The principal
@@ -171,6 +177,17 @@ pub(super) fn negamax(
         if !in_check && depth <= FUTILITY_DEPTH && !is_tactical
             && move_count > 0 && alpha.abs() < MATE_THRESHOLD
             && static_eval + FUTILITY_MARGIN[depth as usize] <= alpha
+        {
+            continue;
+        }
+
+        // --- Late Move Pruning ---
+        // At shallow depths, skip late non-tactical moves once we've searched enough.
+        if !in_check
+            && depth <= LMP_MAX_DEPTH
+            && move_count >= LMP_THRESHOLD[depth as usize]
+            && !is_tactical
+            && best_score > -MATE_THRESHOLD
         {
             continue;
         }
