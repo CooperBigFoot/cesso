@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 cesso-core = { path = "../cesso-core" }
-cesso-engine = { path = "../cesso-engine" }
+cesso-engine = { path = "../cesso-engine", default-features = false }
 thiserror = "2"
 tracing = "0.1"

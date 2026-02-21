@@ -7,40 +7,75 @@
 //! The orchestrator tapers the combined mg/eg values based on game phase
 //! and flips the sign for Black.
 
+#[cfg(all(feature = "hce", feature = "nnue"))]
+compile_error!("Enable exactly one of `hce` or `nnue`");
+#[cfg(not(any(feature = "hce", feature = "nnue")))]
+compile_error!("Enable exactly one of `hce` or `nnue`");
+
+#[cfg(feature = "hce")]
 pub mod king_safety;
+#[cfg(feature = "hce")]
 pub mod material;
+#[cfg(feature = "hce")]
 pub mod mobility;
+#[cfg(feature = "hce")]
 pub mod outposts;
+#[cfg(feature = "hce")]
 pub mod pawns;
 pub mod phase;
+#[cfg(feature = "hce")]
 pub mod pst;
+#[cfg(feature = "hce")]
 pub mod rooks;
+#[cfg(feature = "hce")]
 pub mod score;
 
+#[cfg(feature = "nnue")]
+mod nnue;
+
+#[cfg(feature = "hce")]
 use cesso_core::{Board, Color, PieceKind};
 
+#[cfg(feature = "hce")]
 use self::king_safety::evaluate_king_safety;
+#[cfg(feature = "hce")]
 use self::material::{bishop_knight_balance, material};
+#[cfg(feature = "hce")]
 use self::mobility::evaluate_mobility;
+#[cfg(feature = "hce")]
 use self::outposts::evaluate_outposts;
+#[cfg(feature = "hce")]
 use self::pawns::evaluate_pawns;
+#[cfg(feature = "hce")]
 use self::phase::{game_phase, MAX_PHASE};
+#[cfg(feature = "hce")]
 use self::pst::pst_value;
+#[cfg(feature = "hce")]
 use self::rooks::evaluate_rooks;
+#[cfg(feature = "hce")]
 use self::score::{Score, S};
-
-/// Small tempo bonus for the side to move.
-const TEMPO: Score = S(15, 5);
 
 /// Evaluate the board position and return a centipawn score from the
 /// side-to-move's perspective (positive = good for the side to move).
-///
-/// The evaluation:
-/// 1. Computes all terms from White's perspective as packed [`Score`] values.
-/// 2. Tapers the combined mg/eg values using the game phase.
-/// 3. Flips the sign when Black is to move.
-/// 4. Adds a tempo bonus for the side to move.
-pub fn evaluate(board: &Board) -> i32 {
+pub fn evaluate(board: &cesso_core::Board) -> i32 {
+    #[cfg(feature = "hce")]
+    {
+        hce_evaluate(board)
+    }
+    #[cfg(feature = "nnue")]
+    {
+        nnue::evaluate(board)
+    }
+}
+
+// ── HCE implementation ─────────────────────────────────────────────
+
+/// Small tempo bonus for the side to move.
+#[cfg(feature = "hce")]
+const TEMPO: Score = S(15, 5);
+
+#[cfg(feature = "hce")]
+fn hce_evaluate(board: &Board) -> i32 {
     let white_score = evaluate_white(board);
     let phase = game_phase(board);
     let tapered = taper(white_score, phase);
@@ -56,6 +91,7 @@ pub fn evaluate(board: &Board) -> i32 {
 /// Taper a packed Score into a single centipawn value using the game phase.
 ///
 /// Formula: `(mg * phase + eg * (MAX_PHASE - phase)) / MAX_PHASE`
+#[cfg(feature = "hce")]
 fn taper(score: Score, phase: i32) -> i32 {
     let mg = score.mg() as i32;
     let eg = score.eg() as i32;
@@ -66,6 +102,7 @@ fn taper(score: Score, phase: i32) -> i32 {
 ///
 /// Sums material, piece-square tables, pawn structure, mobility, king safety,
 /// rook placement, and outpost bonuses.
+#[cfg(feature = "hce")]
 fn evaluate_white(board: &Board) -> Score {
     let mut score = Score::ZERO;
 
@@ -84,6 +121,7 @@ fn evaluate_white(board: &Board) -> Score {
 /// Sum piece-square table values for all pieces on the board.
 ///
 /// White pieces contribute positively; Black pieces contribute negatively.
+#[cfg(feature = "hce")]
 fn pst_total(board: &Board) -> Score {
     let mut score = Score::ZERO;
 
@@ -107,6 +145,7 @@ fn pst_total(board: &Board) -> Score {
 }
 
 #[cfg(test)]
+#[cfg(feature = "hce")]
 mod tests {
     use cesso_core::Board;
     use super::evaluate;
