@@ -226,6 +226,7 @@ impl UciEngine {
             params.ponder,
             side,
             Arc::clone(&self.stop_flag),
+            &self.board,
         ));
 
         let max_depth = params.depth.unwrap_or(128);

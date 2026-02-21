@@ -177,6 +177,28 @@ fn multi_thread_reports_total_nodes() {
     );
 }
 
+// ── One-legal-move bypass ─────────────────────────────────────────────────────
+
+#[test]
+fn one_legal_move_bypass_single_thread() {
+    // Ka1 can only go to a2
+    let board: Board = "8/8/8/8/8/1r6/2k5/K7 w - - 0 1".parse().unwrap();
+    let result = search_with_threads(&board, 10, 1);
+    assert_eq!(result.depth, 0, "forced move should skip search (1 thread)");
+    assert_eq!(result.nodes, 0, "forced move should have zero nodes (1 thread)");
+    assert!(!result.best_move.is_null());
+}
+
+#[test]
+fn one_legal_move_bypass_multi_thread() {
+    // Ka1 can only go to a2
+    let board: Board = "8/8/8/8/8/1r6/2k5/K7 w - - 0 1".parse().unwrap();
+    let result = search_with_threads(&board, 10, 4);
+    assert_eq!(result.depth, 0, "forced move should skip search (4 threads)");
+    assert_eq!(result.nodes, 0, "forced move should have zero nodes (4 threads)");
+    assert!(!result.best_move.is_null());
+}
+
 // ── Callback behaviour ────────────────────────────────────────────────────────
 
 #[test]

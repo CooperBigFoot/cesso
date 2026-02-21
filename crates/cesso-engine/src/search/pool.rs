@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cesso_core::{Board, Move};
+use cesso_core::{Board, Move, generate_legal_moves};
 
 use crate::search::control::SearchControl;
 use crate::search::heuristics::{HistoryTable, KillerTable};
@@ -58,6 +58,26 @@ impl ThreadPool {
         F: FnMut(u8, i32, u64, &[Move]),
     {
         self.tt.new_generation();
+
+        let legal_moves = generate_legal_moves(board);
+        if legal_moves.len() == 1 {
+            let forced_move = legal_moves[0];
+            let child = board.make_move(forced_move);
+            let ponder_move = self.tt.probe(child.hash(), 0)
+                .map(|hit| hit.best_move)
+                .filter(|m| !m.is_null());
+            return SearchResult {
+                best_move: forced_move,
+                ponder_move,
+                pv: match ponder_move {
+                    Some(pm) => vec![forced_move, pm],
+                    None => vec![forced_move],
+                },
+                score: 0,
+                nodes: 0,
+                depth: 0,
+            };
+        }
 
         if self.num_threads <= 1 {
             // Single-thread fast path — no scope overhead
@@ -154,7 +174,7 @@ impl ThreadPool {
 
             on_iter(depth, score, ctx.nodes, &completed_pv);
 
-            let scale = stability.update(completed_move, score);
+            let scale = stability.update(completed_move, score, depth);
             control.update_soft_scale(scale);
         }
 
@@ -231,7 +251,7 @@ impl ThreadPool {
 
             on_iter(depth, score, ctx.nodes, &completed_pv);
 
-            let scale = stability.update(completed_move, score);
+            let scale = stability.update(completed_move, score, depth);
             control.update_soft_scale(scale);
         }
 

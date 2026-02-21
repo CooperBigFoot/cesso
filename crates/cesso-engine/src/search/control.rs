@@ -18,6 +18,12 @@ pub struct SearchControl {
     soft_limit: Option<Duration>,
     hard_limit: Option<Duration>,
     soft_scale: AtomicI32,
+    /// Scaling factor applied to the soft limit after ponderhit (in hundredths).
+    ///
+    /// Set to `50` for ponder mode (half the normal soft limit) so that after
+    /// `ponderhit` the engine plays more quickly to compensate for time spent
+    /// pondering. Set to `100` (neutral) for timed and infinite modes.
+    ponder_scale: AtomicI32,
 }
 
 impl SearchControl {
@@ -30,6 +36,7 @@ impl SearchControl {
             soft_limit: None,
             hard_limit: None,
             soft_scale: AtomicI32::new(100),
+            ponder_scale: AtomicI32::new(100),
         }
     }
 
@@ -42,12 +49,17 @@ impl SearchControl {
             soft_limit: Some(soft),
             hard_limit: Some(hard),
             soft_scale: AtomicI32::new(100),
+            ponder_scale: AtomicI32::new(100),
         }
     }
 
     /// Create control for pondering — time limits exist but clock is inactive.
     ///
     /// Call [`activate()`](Self::activate) on `ponderhit` to start the clock.
+    ///
+    /// The `ponder_scale` is baked in at `50` (half the normal soft limit) so
+    /// that after `ponderhit` the engine reacts faster than in a normal timed
+    /// search.  The hard limit is **not** reduced — it remains the full budget.
     pub fn new_ponder(stopped: Arc<AtomicBool>, soft: Duration, hard: Duration) -> Self {
         Self {
             stopped,
@@ -56,6 +68,7 @@ impl SearchControl {
             soft_limit: Some(soft),
             hard_limit: Some(hard),
             soft_scale: AtomicI32::new(100),
+            ponder_scale: AtomicI32::new(50),
         }
     }
 
@@ -109,9 +122,16 @@ impl SearchControl {
 
     /// Check whether iterative deepening should start a new iteration.
     ///
-    /// Called between ID iterations. Returns `true` if the soft limit
-    /// has been exceeded (meaning we likely don't have time for another
-    /// full iteration).
+    /// Called between ID iterations. Returns `true` if the effective soft limit
+    /// has been exceeded (meaning we likely don't have time for another full
+    /// iteration).
+    ///
+    /// The effective soft limit is computed as:
+    /// ```text
+    /// effective = soft * soft_scale/100 * ponder_scale/100
+    /// ```
+    /// and is then clamped to the hard limit so that stability scaling (e.g.
+    /// 250%) can never push the engine past its hard budget.
     pub fn should_stop_iterating(&self) -> bool {
         if self.stopped.load(Ordering::Relaxed) {
             return true;
@@ -123,8 +143,17 @@ impl SearchControl {
 
         if let Some(soft) = self.soft_limit {
             let scale = self.soft_scale.load(Ordering::Relaxed);
-            let effective_ms = (soft.as_millis() as i64 * scale as i64 / 100) as u64;
-            let effective = Duration::from_millis(effective_ms);
+            let ponder_scale = self.ponder_scale.load(Ordering::Relaxed);
+            let effective_ms =
+                (soft.as_millis() as i64 * scale as i64 * ponder_scale as i64 / 10_000) as u64;
+            let mut effective = Duration::from_millis(effective_ms);
+
+            // A1: clamp effective soft limit by the hard limit so that
+            // stability scaling (e.g. 250%) cannot exceed the hard budget.
+            if let Some(hard) = self.hard_limit {
+                effective = effective.min(hard);
+            }
+
             return self.elapsed() >= effective;
         }
 
@@ -177,5 +206,98 @@ mod tests {
         control.update_soft_scale(1); // Very aggressive scale
         // Hard limit is unaffected by soft scale
         assert!(!control.should_stop(2048)); // check at node 2048
+    }
+
+    // --- A3 tests ---
+
+    /// A1: effective soft (10s * 2.5 = 25s) must be clamped to hard (5s).
+    /// Since elapsed ~0 the call returns false, but the test also verifies the
+    /// clamping path does not panic with a hard < soft configuration.
+    #[test]
+    fn soft_scale_clamped_by_hard_limit() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_timed(
+            stopped,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        control.update_soft_scale(250); // would give 25s without clamping
+        // Effective = min(10s * 2.5, 5s) = 5s. Elapsed ~0 → should not stop.
+        assert!(!control.should_stop_iterating());
+    }
+
+    /// A2: ponder_scale of 50 halves the effective soft limit after ponderhit.
+    /// effective = 10s * 100/100 * 50/100 = 5s. Elapsed ~0 → should not stop.
+    #[test]
+    fn ponder_scale_reduces_soft_limit() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_ponder(
+            stopped,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        control.activate();
+        // Default soft_scale=100, ponder_scale=50 → effective = 5s
+        assert!(!control.should_stop_iterating());
+    }
+
+    /// A2: ponder_scale composes with a stability soft_scale reduction.
+    /// effective = 10s * 60/100 * 50/100 = 3s. Elapsed ~0 → should not stop.
+    #[test]
+    fn ponder_scale_composes_with_stability() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_ponder(
+            stopped,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        control.activate();
+        control.update_soft_scale(60);
+        // effective = 10s * 60/100 * 50/100 = 3s
+        assert!(!control.should_stop_iterating());
+    }
+
+    /// A2: ponder_scale is neutral (100) for a regular timed search.
+    /// effective = 10s * 100/100 * 100/100 = 10s. Elapsed ~0 → should not stop.
+    #[test]
+    fn timed_search_ponder_scale_is_neutral() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_timed(
+            stopped,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        // ponder_scale defaults to 100 for timed searches
+        assert!(!control.should_stop_iterating());
+    }
+
+    /// A2: the hard limit is NOT reduced for ponder mode — only the soft limit
+    /// is halved. Since elapsed ~0 and hard=30s, should_stop returns false.
+    #[test]
+    fn ponder_hard_limit_not_affected() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_ponder(
+            stopped,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        control.activate();
+        // Hard limit still 30s; elapsed ~0 → should not stop
+        assert!(!control.should_stop(2048));
+    }
+
+    /// A2: an unactivated ponder control must never trigger a stop — neither
+    /// the soft path (clock inactive) nor the hard path (clock inactive).
+    #[test]
+    fn inactive_ponder_does_not_stop() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let control = SearchControl::new_ponder(
+            stopped,
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        );
+        // Clock not activated — both checks must return false
+        assert!(!control.should_stop_iterating());
+        assert!(!control.should_stop(2048));
     }
 }

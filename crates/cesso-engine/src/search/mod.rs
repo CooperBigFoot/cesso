@@ -40,6 +40,7 @@ pub(super) struct StabilityTracker {
     last_move: Move,
     last_score: i32,
     stable_streak: u32,
+    peak_score: i32,
 }
 
 impl StabilityTracker {
@@ -48,16 +49,21 @@ impl StabilityTracker {
             last_move: Move::NULL,
             last_score: 0,
             stable_streak: 0,
+            peak_score: -30_000,
         }
     }
 
     /// Update with the latest iteration results and return a scale factor (in hundredths).
     ///
-    /// - Score drop > 100cp: 250 (think much longer)
-    /// - Score drop > 50cp: 180 (think longer)
-    /// - Stable streak >= 3: 60 (play faster)
-    /// - Otherwise: 100 (neutral)
-    fn update(&mut self, best_move: Move, score: i32) -> i32 {
+    /// `depth` is the current iterative-deepening depth (u8). Priority order:
+    ///
+    /// - Score drop > 100cp: 250 (think much longer), resets streak and peak
+    /// - Score drop > 50cp: 180 (think longer), resets streak and peak
+    /// - Same move, easy-move condition (`stable_streak >= 5 && depth >= 8 && peak_score - score <= 10`): 30 (very fast)
+    /// - Same move, streak >= 3: 60 (play faster)
+    /// - Same move, streak < 3: 100 (neutral)
+    /// - Move changed: 100 (neutral), resets streak and peak
+    fn update(&mut self, best_move: Move, score: i32, depth: u8) -> i32 {
         let scale;
 
         if self.last_move.is_null() {
@@ -69,14 +75,20 @@ impl StabilityTracker {
             if score_drop > 100 {
                 // Score dropped significantly — think much longer
                 self.stable_streak = 0;
+                self.peak_score = -30_000;
                 scale = 250;
             } else if score_drop > 50 {
                 // Moderate score drop — think longer
                 self.stable_streak = 0;
+                self.peak_score = -30_000;
                 scale = 180;
             } else if best_move == self.last_move {
                 self.stable_streak += 1;
-                if self.stable_streak >= 3 {
+                self.peak_score = self.peak_score.max(score);
+                if self.stable_streak >= 5 && depth >= 8 && (self.peak_score - score) <= 10 {
+                    // Easy move — very stable, high depth, score hasn't eroded
+                    scale = 30;
+                } else if self.stable_streak >= 3 {
                     scale = 60;
                 } else {
                     scale = 100;
@@ -84,6 +96,7 @@ impl StabilityTracker {
             } else {
                 // Move changed — reset stability
                 self.stable_streak = 0;
+                self.peak_score = -30_000;
                 scale = 100;
             }
         }
@@ -133,6 +146,26 @@ impl Searcher {
         F: FnMut(u8, i32, u64, &[Move]),
     {
         self.tt.new_generation();
+
+        let legal_moves = generate_legal_moves(board);
+        if legal_moves.len() == 1 {
+            let forced_move = legal_moves[0];
+            let child = board.make_move(forced_move);
+            let ponder_move = self.tt.probe(child.hash(), 0)
+                .map(|hit| hit.best_move)
+                .filter(|m| !m.is_null());
+            return SearchResult {
+                best_move: forced_move,
+                ponder_move,
+                pv: match ponder_move {
+                    Some(pm) => vec![forced_move, pm],
+                    None => vec![forced_move],
+                },
+                score: 0,
+                nodes: 0,
+                depth: 0,
+            };
+        }
 
         let mut ctx = SearchContext {
             nodes: 0,
@@ -184,7 +217,7 @@ impl Searcher {
             on_iter(depth, score, ctx.nodes, &completed_pv);
 
             // Update time management based on best-move stability
-            let scale = stability.update(completed_move, score);
+            let scale = stability.update(completed_move, score, depth);
             control.update_soft_scale(scale);
         }
 
@@ -519,7 +552,7 @@ mod tests {
     fn stability_neutral_on_first_iteration() {
         let mut tracker = StabilityTracker::new();
         let mv = cesso_core::Move::new(cesso_core::Square::E2, cesso_core::Square::E4);
-        let scale = tracker.update(mv, 25);
+        let scale = tracker.update(mv, 25, 1);
         assert_eq!(scale, 100, "first iteration should be neutral");
     }
 
@@ -527,10 +560,10 @@ mod tests {
     fn stability_streak_triggers_fast_play() {
         let mut tracker = StabilityTracker::new();
         let mv = cesso_core::Move::new(cesso_core::Square::E2, cesso_core::Square::E4);
-        tracker.update(mv, 25); // first
-        tracker.update(mv, 25); // streak 1
-        tracker.update(mv, 25); // streak 2
-        let scale = tracker.update(mv, 25); // streak 3
+        tracker.update(mv, 25, 1); // first
+        tracker.update(mv, 25, 2); // streak 1
+        tracker.update(mv, 25, 3); // streak 2
+        let scale = tracker.update(mv, 25, 4); // streak 3
         assert_eq!(scale, 60, "stable streak >= 3 should return 60");
     }
 
@@ -538,12 +571,64 @@ mod tests {
     fn stability_score_drop_overrides() {
         let mut tracker = StabilityTracker::new();
         let mv = cesso_core::Move::new(cesso_core::Square::E2, cesso_core::Square::E4);
-        tracker.update(mv, 100);
-        tracker.update(mv, 100);
-        tracker.update(mv, 100);
+        tracker.update(mv, 100, 1);
+        tracker.update(mv, 100, 2);
+        tracker.update(mv, 100, 3);
         // Big score drop even though move is stable
-        let scale = tracker.update(mv, -50);
+        let scale = tracker.update(mv, -50, 4);
         assert_eq!(scale, 250, "score drop > 100cp should trigger alarm (250)");
+    }
+
+    #[test]
+    fn easy_move_triggers_at_depth_8_with_stable_streak_5() {
+        let mut tracker = StabilityTracker::new();
+        let mv = cesso_core::Move::new(cesso_core::Square::E2, cesso_core::Square::E4);
+        // Build up streak: first call + 5 more = stable_streak reaches 5
+        tracker.update(mv, 50, 1);  // first (streak stays 0, neutral)
+        tracker.update(mv, 50, 2);  // streak 1
+        tracker.update(mv, 50, 3);  // streak 2
+        tracker.update(mv, 50, 4);  // streak 3
+        tracker.update(mv, 50, 5);  // streak 4
+        let scale = tracker.update(mv, 50, 8);  // streak 5, depth 8 -> easy move
+        assert_eq!(scale, 30, "easy move should trigger at streak 5, depth 8");
+    }
+
+    #[test]
+    fn easy_move_does_not_trigger_at_low_depth() {
+        let mut tracker = StabilityTracker::new();
+        let mv = cesso_core::Move::new(cesso_core::Square::E2, cesso_core::Square::E4);
+        tracker.update(mv, 50, 1);  // first
+        tracker.update(mv, 50, 2);  // streak 1
+        tracker.update(mv, 50, 3);  // streak 2
+        tracker.update(mv, 50, 4);  // streak 3
+        tracker.update(mv, 50, 5);  // streak 4
+        let scale = tracker.update(mv, 50, 7);  // streak 5 but depth only 7
+        assert_eq!(scale, 60, "easy move should NOT trigger at depth < 8, should be 60 (stable)");
+    }
+
+    #[test]
+    fn easy_move_not_triggered_when_score_erodes() {
+        let mut tracker = StabilityTracker::new();
+        let mv = cesso_core::Move::new(cesso_core::Square::E2, cesso_core::Square::E4);
+        tracker.update(mv, 50, 1);  // first, peak_score set to 50
+        tracker.update(mv, 55, 2);  // streak 1, peak_score -> 55
+        tracker.update(mv, 55, 3);  // streak 2, peak_score stays 55
+        tracker.update(mv, 55, 4);  // streak 3
+        tracker.update(mv, 55, 5);  // streak 4
+        // Score drops by 20 from peak (55 -> 35), exceeds threshold of 10
+        let scale = tracker.update(mv, 35, 8);  // streak 5, depth 8, but score eroded
+        assert_eq!(scale, 60, "easy move should NOT trigger when score erodes > 10cp from peak");
+    }
+
+    #[test]
+    fn one_legal_move_returns_immediately() {
+        // Ka1 can only go to a2 (b1 and b2 blocked by Rb3)
+        let board: Board = "8/8/8/8/8/1r6/2k5/K7 w - - 0 1".parse().unwrap();
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 10);
+        assert_eq!(result.depth, 0, "forced move should skip search");
+        assert_eq!(result.nodes, 0, "forced move should search zero nodes");
+        assert!(!result.best_move.is_null(), "should return the forced move");
     }
 
     #[test]
