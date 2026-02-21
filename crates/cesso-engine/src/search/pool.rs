@@ -127,7 +127,7 @@ impl ThreadPool {
                 break;
             }
 
-            let score = negamax(board, depth, 0, -INF, INF, &mut ctx);
+            let score = negamax(board, depth, 0, -INF, INF, true, &mut ctx);
 
             if control.should_stop(ctx.nodes) {
                 break;
@@ -193,7 +193,7 @@ impl ThreadPool {
                 break;
             }
 
-            let score = negamax(board, depth, 0, -INF, INF, &mut ctx);
+            let score = negamax(board, depth, 0, -INF, INF, true, &mut ctx);
 
             if control.should_stop(ctx.nodes) {
                 break;
@@ -258,7 +258,7 @@ fn run_helper(
             break;
         }
 
-        negamax(board, depth, 0, -INF, INF, &mut ctx);
+        negamax(board, depth, 0, -INF, INF, true, &mut ctx);
 
         if control.should_stop(ctx.nodes) {
             break;

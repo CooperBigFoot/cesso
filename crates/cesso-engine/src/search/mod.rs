@@ -87,7 +87,7 @@ impl Searcher {
                 break;
             }
 
-            let score = negamax(board, depth, 0, -INF, INF, &mut ctx);
+            let score = negamax(board, depth, 0, -INF, INF, true, &mut ctx);
 
             // If search was aborted mid-iteration, discard this iteration's result
             if control.should_stop(ctx.nodes) {
@@ -343,6 +343,25 @@ mod tests {
             "search should have been stopped before depth 100, got depth {}",
             result.depth
         );
+    }
+
+    #[test]
+    fn nmp_still_finds_mate_in_one() {
+        let board: Board = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
+            .parse()
+            .unwrap();
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 4);
+        assert_eq!(result.best_move.to_uci(), "h5f7", "NMP should not break mate-in-one");
+        assert!(result.score > negamax::MATE_THRESHOLD);
+    }
+
+    #[test]
+    fn nmp_stalemate_still_zero() {
+        let board: Board = "k7/2K5/1Q6/8/8/8/8/8 b - - 0 1".parse().unwrap();
+        let searcher = Searcher::new();
+        let result = search_depth(&searcher, &board, 4);
+        assert_eq!(result.score, 0, "stalemate should still return 0 with NMP");
     }
 
     #[test]

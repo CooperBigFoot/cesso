@@ -243,6 +243,30 @@ impl Board {
 
         b
     }
+
+    /// Apply a null move (pass) — flips the side to move without moving any piece.
+    ///
+    /// Used in null move pruning. The null-move board clears en passant,
+    /// toggles the side to move, and increments the halfmove clock.
+    /// Castling rights and pieces are unchanged.
+    pub fn make_null_move(&self) -> Board {
+        let mut b = *self;
+
+        // Clear en passant and update hash
+        if let Some(old_ep) = b.en_passant() {
+            b.set_hash(b.hash() ^ zobrist::EN_PASSANT_FILE[old_ep.file().index()]);
+            b.set_en_passant(None);
+        }
+
+        // Toggle side to move
+        b.set_side_to_move(!b.side_to_move());
+        b.set_hash(b.hash() ^ zobrist::SIDE_TO_MOVE);
+
+        // Increment halfmove clock
+        b.set_halfmove_clock(b.halfmove_clock() + 1);
+
+        b
+    }
 }
 
 #[cfg(test)]
@@ -545,5 +569,67 @@ mod tests {
                 mv
             );
         }
+    }
+
+    // --- Null move tests ---
+
+    #[test]
+    fn null_move_flips_side() {
+        let board = starting();
+        let null = board.make_null_move();
+        assert_eq!(null.side_to_move(), Color::Black);
+        let null2 = null.make_null_move();
+        assert_eq!(null2.side_to_move(), Color::White);
+    }
+
+    #[test]
+    fn null_move_clears_en_passant() {
+        let board = starting()
+            .make_move(Move::new(Square::E2, Square::E4));
+        assert!(board.en_passant().is_some());
+        let null = board.make_null_move();
+        assert!(null.en_passant().is_none());
+    }
+
+    #[test]
+    fn null_move_preserves_pieces() {
+        let board = starting();
+        let null = board.make_null_move();
+        for kind in PieceKind::ALL {
+            assert_eq!(board.pieces(kind), null.pieces(kind), "piece {:?} changed", kind);
+        }
+        for color in Color::ALL {
+            assert_eq!(board.side(color), null.side(color), "side {:?} changed", color);
+        }
+    }
+
+    #[test]
+    fn null_move_preserves_castling() {
+        let board = starting();
+        let null = board.make_null_move();
+        assert_eq!(board.castling(), null.castling());
+    }
+
+    #[test]
+    fn null_move_hash_matches_scratch() {
+        let board = starting();
+        let null = board.make_null_move();
+        assert_eq!(null.hash(), crate::zobrist::hash_from_scratch(&null));
+    }
+
+    #[test]
+    fn null_move_hash_with_ep_matches_scratch() {
+        let board = starting()
+            .make_move(Move::new(Square::E2, Square::E4));
+        let null = board.make_null_move();
+        assert_eq!(null.hash(), crate::zobrist::hash_from_scratch(&null));
+    }
+
+    #[test]
+    fn null_move_increments_halfmove() {
+        let board = starting();
+        assert_eq!(board.halfmove_clock(), 0);
+        let null = board.make_null_move();
+        assert_eq!(null.halfmove_clock(), 1);
     }
 }
