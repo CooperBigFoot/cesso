@@ -2,6 +2,10 @@
 
 pub mod eval;
 pub mod search;
+pub mod time;
+pub(crate) mod book;
 
 pub use eval::evaluate;
+pub use search::control::SearchControl;
 pub use search::{SearchResult, Searcher};
+pub use time::limits_from_go;

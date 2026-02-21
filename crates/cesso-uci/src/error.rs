@@ -21,10 +21,19 @@ pub enum UciError {
         uci_move: String,
     },
 
-    /// The depth value in `go depth` could not be parsed.
-    #[error("invalid depth: {value}")]
-    InvalidDepth {
-        /// The depth string that failed to parse.
+    /// A `go` parameter is missing its required value.
+    #[error("missing value for go parameter: {param}")]
+    MissingGoValue {
+        /// The parameter name (e.g., "wtime", "depth").
+        param: String,
+    },
+
+    /// A `go` parameter value could not be parsed.
+    #[error("invalid value for go parameter {param}: {value}")]
+    InvalidGoValue {
+        /// The parameter name.
+        param: String,
+        /// The value string that failed to parse.
         value: String,
     },
 
