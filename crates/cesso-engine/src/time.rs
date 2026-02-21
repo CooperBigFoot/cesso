@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn compute_limits_no_increment_hard_cap_tight() {
-        let (soft, hard) = compute_limits(
+        let (_soft, hard) = compute_limits(
             Duration::from_secs(60),
             Duration::ZERO,
             None,

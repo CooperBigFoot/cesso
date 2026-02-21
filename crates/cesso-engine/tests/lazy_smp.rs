@@ -5,7 +5,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use cesso_core::Board;
 use cesso_engine::{SearchControl, SearchResult, ThreadPool};
@@ -28,7 +27,7 @@ fn search_with_threads(board: &Board, depth: u8, threads: usize) -> SearchResult
     pool.set_num_threads(threads);
     let stopped = Arc::new(AtomicBool::new(false));
     let control = SearchControl::new_infinite(stopped);
-    pool.search(board, depth, &control, |_, _, _, _| {})
+    pool.search(board, depth, &control, &[], |_, _, _, _| {})
 }
 
 // ── Basic correctness ─────────────────────────────────────────────────────────
@@ -119,42 +118,24 @@ fn multi_thread_various_positions() {
 
 #[test]
 fn stop_signal_terminates_all_threads() {
-    use std::thread;
-
     let board = Board::starting_position();
     let mut pool = ThreadPool::new(16);
     pool.set_num_threads(4);
 
     let stopped = Arc::new(AtomicBool::new(false));
-    let control = Arc::new(SearchControl::new_infinite(Arc::clone(&stopped)));
+    let control = SearchControl::new_infinite(Arc::clone(&stopped));
 
-    // Set the stop flag after 50 ms from a background thread.
+    // Stop after depth 1 callback fires
     let stop_clone = Arc::clone(&stopped);
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        stop_clone.store(true, Ordering::Release);
+    let result = pool.search(&board, 128, &control, &[], |depth, _, _, _| {
+        if depth >= 1 {
+            stop_clone.store(true, Ordering::Release);
+        }
     });
-
-    // Run the search in a dedicated thread so we can join with a timeout.
-    let (tx, rx) = std::sync::mpsc::channel::<SearchResult>();
-    let board_clone = board.clone();
-    let control_clone = Arc::clone(&control);
-    thread::spawn(move || {
-        let mut pool_inner = ThreadPool::new(16);
-        pool_inner.set_num_threads(4);
-        let result =
-            pool_inner.search(&board_clone, 100, &control_clone, |_, _, _, _| {});
-        let _ = tx.send(result);
-    });
-
-    let deadline = Duration::from_secs(5);
-    let result = rx
-        .recv_timeout(deadline)
-        .expect("search with stop signal did not complete within 5 seconds");
 
     assert!(
-        result.depth < 100,
-        "search should have been stopped before depth 100, got depth {}",
+        result.depth <= 2,
+        "search should stop shortly after flag is set, got depth {}",
         result.depth
     );
 }
@@ -169,7 +150,7 @@ fn pre_set_stop_returns_immediately() {
     let stopped = Arc::new(AtomicBool::new(true));
     let control = SearchControl::new_infinite(Arc::clone(&stopped));
 
-    let result = pool.search(&board, 100, &control, |_, _, _, _| {});
+    let result = pool.search(&board, 100, &control, &[], |_, _, _, _| {});
 
     assert_eq!(
         result.depth, 0,
@@ -208,7 +189,7 @@ fn on_iter_callback_fires() {
     let control = SearchControl::new_infinite(stopped);
 
     let mut depths_seen: Vec<u8> = Vec::new();
-    pool.search(&board, 3, &control, |depth, _, _, _| {
+    pool.search(&board, 3, &control, &[], |depth, _, _, _| {
         depths_seen.push(depth);
     });
 

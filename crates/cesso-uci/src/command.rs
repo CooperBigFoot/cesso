@@ -44,6 +44,16 @@ pub enum UciOption {
     Ponder(bool),
 }
 
+/// Board position with game history for repetition detection.
+#[derive(Debug, Clone)]
+pub struct PositionInfo {
+    /// The current board position.
+    pub board: Board,
+    /// Zobrist hashes of all positions from game start, up to but NOT
+    /// including the current position.
+    pub history: Vec<u64>,
+}
+
 /// A parsed UCI command.
 #[derive(Debug)]
 pub enum Command {
@@ -54,7 +64,7 @@ pub enum Command {
     /// `ucinewgame` -- reset engine state.
     UciNewGame,
     /// `position` -- set up a board position with optional moves applied.
-    Position(Board),
+    Position(PositionInfo),
     /// `go` -- start searching with given parameters.
     Go(GoParams),
     /// `setoption` -- configure an engine option.
@@ -120,8 +130,10 @@ fn parse_position(tokens: &[&str]) -> Result<Command, UciError> {
     };
 
     // Apply moves if present: "moves e2e4 d7d5 ..."
+    let mut history = Vec::new();
     if !rest.is_empty() && rest[0] == "moves" {
         for uci_str in &rest[1..] {
+            history.push(board.hash());
             let mv = Move::from_uci(uci_str, &board).ok_or_else(|| UciError::InvalidMove {
                 uci_move: uci_str.to_string(),
             })?;
@@ -129,7 +141,7 @@ fn parse_position(tokens: &[&str]) -> Result<Command, UciError> {
         }
     }
 
-    Ok(Command::Position(board))
+    Ok(Command::Position(PositionInfo { board, history }))
 }
 
 /// Parse the `go` command arguments.
@@ -548,5 +560,16 @@ mod tests {
     fn parse_setoption_invalid_hash_value() {
         let result = parse_command("setoption name Hash value abc");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_position_builds_history() {
+        let cmd = parse_command("position startpos moves e2e4 e7e5").unwrap();
+        match cmd {
+            Command::Position(info) => {
+                assert_eq!(info.history.len(), 2, "2 moves should produce 2 history entries");
+            }
+            _ => panic!("expected Position"),
+        }
     }
 }

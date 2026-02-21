@@ -46,6 +46,19 @@ pub(super) fn negamax(
         return 0;
     }
 
+    // Repetition detection (twofold repetition = draw in search)
+    if ply > 0 {
+        let hash = board.hash();
+        let hmc = board.halfmove_clock() as usize;
+        let len = ctx.history.len();
+        let lookback = hmc.min(len);
+        for i in (len.saturating_sub(lookback)..len).rev() {
+            if ctx.history[i] == hash {
+                return 0;
+            }
+        }
+    }
+
     // Probe transposition table
     let mut tt_move = Move::NULL;
     if let Some(tt_entry) = ctx.tt.probe(board.hash(), ply) {
@@ -84,6 +97,7 @@ pub(super) fn negamax(
         if !in_check {
             let r = if depth >= 6 { 3 } else { 2 };
             let null_board = board.make_null_move();
+            ctx.history.push(null_board.hash());
             let null_score = -negamax(
                 &null_board,
                 depth.saturating_sub(1 + r),
@@ -93,6 +107,7 @@ pub(super) fn negamax(
                 false,
                 ctx,
             );
+            ctx.history.pop();
             if null_score >= beta {
                 return beta;
             }
@@ -117,7 +132,7 @@ pub(super) fn negamax(
     let original_alpha = alpha;
     let mut best_score = -INF;
     let mut best_move = Move::NULL;
-    let mut picker = MovePicker::new(&moves, board, tt_move, &ctx.killers, &ctx.history, ply as usize);
+    let mut picker = MovePicker::new(&moves, board, tt_move, &ctx.killers, &ctx.history_table, ply as usize);
     let mut searched_quiets = [Move::NULL; 64];
     let mut quiet_count: usize = 0;
     let mut move_count: usize = 0;
@@ -132,6 +147,9 @@ pub(super) fn negamax(
 
         let child = board.make_move(mv);
         move_count += 1;
+
+        // Push child position hash for repetition detection
+        ctx.history.push(child.hash());
 
         // --- Late Move Reductions (LMR) ---
         let is_tactical = board.piece_on(mv.dest()).is_some()
@@ -153,6 +171,9 @@ pub(super) fn negamax(
             score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
         }
 
+        // Pop child position hash after recursion
+        ctx.history.pop();
+
         if score > best_score {
             best_score = score;
             best_move = mv;
@@ -168,12 +189,12 @@ pub(super) fn negamax(
             if is_quiet {
                 ctx.killers.store(ply as usize, mv);
                 if let Some(piece) = board.piece_on(mv.source()) {
-                    ctx.history.update_good(piece, mv.dest().index(), depth);
+                    ctx.history_table.update_good(piece, mv.dest().index(), depth);
                     // Penalise all quiet moves searched before the cutoff move
                     for i in 0..quiet_count {
                         let bad_mv = searched_quiets[i];
                         if let Some(bad_piece) = board.piece_on(bad_mv.source()) {
-                            ctx.history.update_bad(bad_piece, bad_mv.dest().index(), depth);
+                            ctx.history_table.update_bad(bad_piece, bad_mv.dest().index(), depth);
                         }
                     }
                 }
@@ -400,5 +421,8 @@ pub(super) struct SearchContext<'a> {
     /// Killer move table.
     pub killers: KillerTable,
     /// History heuristic table.
-    pub history: HistoryTable,
+    pub history_table: HistoryTable,
+    /// Zobrist hashes of positions visited during this search (for repetition detection).
+    /// Grows/shrinks with the search stack via push/pop.
+    pub history: Vec<u64>,
 }

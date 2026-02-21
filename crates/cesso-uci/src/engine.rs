@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use cesso_core::Board;
 use cesso_engine::{SearchControl, SearchResult, ThreadPool, limits_from_go};
 
-use crate::command::{GoParams, UciOption, parse_command, Command};
+use crate::command::{GoParams, UciOption, parse_command, Command, PositionInfo};
 use crate::error::UciError;
 
 /// Configuration knobs adjustable via `setoption`.
@@ -55,6 +55,7 @@ struct SearchDone {
 /// to a worker thread and processing UCI commands concurrently.
 pub struct UciEngine {
     board: Board,
+    history: Vec<u64>,
     pool: Option<ThreadPool>,
     state: EngineState,
     stop_flag: Arc<AtomicBool>,
@@ -70,6 +71,7 @@ impl UciEngine {
     pub fn new() -> Self {
         Self {
             board: Board::starting_position(),
+            history: Vec::new(),
             pool: Some(ThreadPool::new(16)),
             state: EngineState::Idle,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -117,7 +119,7 @@ impl UciEngine {
                     Command::Uci => self.handle_uci(),
                     Command::IsReady => self.handle_isready(),
                     Command::UciNewGame => self.handle_ucinewgame(),
-                    Command::Position(board) => self.handle_position(board),
+                    Command::Position(info) => self.handle_position(info),
                     Command::Go(params) => self.handle_go(params, &tx),
                     Command::SetOption(opt) => self.handle_setoption(opt),
                     Command::PonderHit => self.handle_ponderhit(),
@@ -167,6 +169,7 @@ impl UciEngine {
 
     fn handle_ucinewgame(&mut self) {
         self.board = Board::starting_position();
+        self.history.clear();
         if let Some(ref pool) = self.pool {
             pool.clear_tt();
         } else {
@@ -197,8 +200,9 @@ impl UciEngine {
         }
     }
 
-    fn handle_position(&mut self, board: Board) {
-        self.board = board;
+    fn handle_position(&mut self, info: PositionInfo) {
+        self.board = info.board;
+        self.history = info.history;
     }
 
     fn handle_go(&mut self, params: GoParams, tx: &mpsc::Sender<EngineEvent>) {
@@ -230,11 +234,12 @@ impl UciEngine {
         let pool = self.pool.take().unwrap_or_default();
 
         let board = self.board;
+        let history = self.history.clone();
         let search_control = Arc::clone(&control);
         let tx = tx.clone();
 
         std::thread::spawn(move || {
-            let result = pool.search(&board, max_depth, &search_control, |d, score, nodes, pv| {
+            let result = pool.search(&board, max_depth, &search_control, &history, |d, score, nodes, pv| {
                 let elapsed = search_control.elapsed();
                 let elapsed_ms = elapsed.as_millis().max(1);
                 let nps = (nodes as u128 * 1000) / elapsed_ms;

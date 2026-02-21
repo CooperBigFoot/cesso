@@ -2,6 +2,8 @@
 
 use cesso_core::{Board, Move, MoveKind, MoveList, PieceKind, PromotionPiece};
 
+use crate::search::heuristics::{HistoryTable, KillerTable};
+
 /// MVV-LVA scores indexed by `[victim][attacker]`.
 ///
 /// Weights: Pawn=1, Knight=3, Bishop=3, Rook=5, Queen=9, King=0.
@@ -21,15 +23,49 @@ const MVV_LVA: [[i32; 6]; 6] = [
     [-1, -3, -3, -5, -9, 0],
 ];
 
-/// Score a move for ordering purposes.
+/// Score a move for ordering purposes (main search with killer and history context).
 ///
 /// Higher scores are searched first. Score bands:
+/// - TT move: 10,000 (assigned by MovePicker, not here)
+/// - Killer moves: 5,000
 /// - Queen promotion: 200
 /// - Rook promotion: 170
 /// - Bishop/Knight promotion: 160
 /// - Captures (MVV-LVA): 7..144
 /// - En passant: 15
-/// - Quiet / Castling: 0
+/// - Quiet (history-scored): -16384..16384 (centered around 0)
+/// - Castling: 1
+fn score_move_full(
+    board: &Board,
+    mv: Move,
+    killers: &KillerTable,
+    history: &HistoryTable,
+    ply: usize,
+) -> i32 {
+    match mv.kind() {
+        MoveKind::Promotion => match mv.promotion_piece() {
+            PromotionPiece::Queen => 200,
+            PromotionPiece::Rook => 170,
+            PromotionPiece::Bishop | PromotionPiece::Knight => 160,
+        },
+        MoveKind::EnPassant => 15,
+        MoveKind::Castling => 1,
+        MoveKind::Normal => {
+            if let Some(victim) = board.piece_on(mv.dest()) {
+                let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
+                MVV_LVA[victim.index()][attacker.index()]
+            } else if killers.is_killer(ply, mv) {
+                5_000
+            } else {
+                // History score for quiet moves
+                let piece = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
+                history.score(piece, mv.dest().index())
+            }
+        }
+    }
+}
+
+/// Score a move for quiescence search (no killers or history needed).
 pub fn score_move(board: &Board, mv: Move) -> i32 {
     match mv.kind() {
         MoveKind::Promotion => match mv.promotion_piece() {
@@ -67,7 +103,15 @@ impl MovePicker {
     ///
     /// If `tt_move` is not null and matches a move in the list, it receives
     /// the highest priority score (10,000), ensuring it is searched first.
-    pub fn new(moves: &MoveList, board: &Board, tt_move: Move) -> Self {
+    /// Killer and history context are used to score quiet moves.
+    pub fn new(
+        moves: &MoveList,
+        board: &Board,
+        tt_move: Move,
+        killers: &KillerTable,
+        history: &HistoryTable,
+        ply: usize,
+    ) -> Self {
         let mut picker = Self {
             moves: [Move::NULL; 256],
             scores: [0; 256],
@@ -80,7 +124,7 @@ impl MovePicker {
             picker.scores[i] = if moves[i] == tt_move {
                 10_000
             } else {
-                score_move(board, moves[i])
+                score_move_full(board, moves[i], killers, history, ply)
             };
         }
         picker
@@ -140,6 +184,7 @@ impl MovePicker {
 mod tests {
     use super::*;
     use cesso_core::{generate_legal_moves, Board};
+    use crate::search::heuristics::{HistoryTable, KillerTable};
 
     #[test]
     fn pawn_takes_queen_scores_higher_than_queen_takes_pawn() {
@@ -197,7 +242,7 @@ mod tests {
     fn picker_yields_all_moves_in_starting_position() {
         let board = Board::starting_position();
         let moves = generate_legal_moves(&board);
-        let mut picker = MovePicker::new(&moves, &board, Move::NULL);
+        let mut picker = MovePicker::new(&moves, &board, Move::NULL, &KillerTable::new(), &HistoryTable::new(), 0);
         let mut count = 0;
         while picker.pick_next().is_some() {
             count += 1;
@@ -211,7 +256,7 @@ mod tests {
         // White queen on d4, black pawn on e5 — QxP is a capture
         let board: Board = "4k3/8/8/4p3/3Q4/8/8/4K3 w - - 0 1".parse().unwrap();
         let moves = generate_legal_moves(&board);
-        let mut picker = MovePicker::new(&moves, &board, Move::NULL);
+        let mut picker = MovePicker::new(&moves, &board, Move::NULL, &KillerTable::new(), &HistoryTable::new(), 0);
         let first = picker.pick_next().unwrap();
         // First move should be the capture (highest scored)
         assert!(
