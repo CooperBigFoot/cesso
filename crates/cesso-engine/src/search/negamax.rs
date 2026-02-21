@@ -45,19 +45,17 @@ pub(super) fn negamax(
         tt_move = tt_entry.best_move;
         // Cutoff if the stored depth is sufficient
         if tt_entry.depth >= depth {
-            match tt_entry.bound {
-                Bound::Exact => return tt_entry.score,
-                Bound::LowerBound => {
-                    if tt_entry.score >= beta {
-                        return tt_entry.score;
-                    }
+            let cutoff = match tt_entry.bound {
+                Bound::Exact => true,
+                Bound::LowerBound => tt_entry.score >= beta,
+                Bound::UpperBound => tt_entry.score <= alpha,
+                Bound::None => false,
+            };
+            if cutoff {
+                if ply == 0 && !tt_entry.best_move.is_null() {
+                    *root_best_move = tt_entry.best_move;
                 }
-                Bound::UpperBound => {
-                    if tt_entry.score <= alpha {
-                        return tt_entry.score;
-                    }
-                }
-                Bound::None => {}
+                return tt_entry.score;
             }
         }
     }

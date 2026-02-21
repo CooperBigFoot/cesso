@@ -200,9 +200,10 @@ impl Move {
     ///
     /// # Panics
     ///
-    /// Debug-asserts that the move is not null.
+    /// Panics if the move is null. A null move reaching UCI output
+    /// indicates a search bug — fail loudly rather than emitting `a1a1`.
     pub fn to_uci(self) -> String {
-        debug_assert!(!self.is_null(), "to_uci called on null move");
+        assert!(!self.is_null(), "to_uci called on null move — search returned Move::NULL");
         if self.is_promotion() {
             format!("{}{}{}", self.source(), self.dest(), self.promotion_piece().uci_char())
         } else {
