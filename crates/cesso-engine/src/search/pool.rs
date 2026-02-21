@@ -9,6 +9,7 @@ use crate::search::heuristics::{HistoryTable, KillerTable};
 use crate::search::negamax::{INF, PvTable, SearchContext, aspiration_search};
 use crate::search::tt::TranspositionTable;
 use crate::search::SearchResult;
+use crate::search::StabilityTracker;
 
 /// Lazy SMP thread pool — owns the shared transposition table.
 pub struct ThreadPool {
@@ -50,6 +51,7 @@ impl ThreadPool {
         board: &Board,
         max_depth: u8,
         control: &SearchControl,
+        history: &[u64],
         mut on_iter: F,
     ) -> SearchResult
     where
@@ -59,7 +61,7 @@ impl ThreadPool {
 
         if self.num_threads <= 1 {
             // Single-thread fast path — no scope overhead
-            return self.search_single(board, max_depth, control, on_iter);
+            return self.search_single(board, max_depth, control, history, on_iter);
         }
 
         // Shared node counters — one AtomicU64 per thread to avoid contention
@@ -81,12 +83,12 @@ impl ThreadPool {
             for (thread_id, node_counter) in node_counters.iter().enumerate().skip(1) {
                 let tt = &self.tt;
                 s.spawn(move || {
-                    run_helper(thread_id, tt, board, max_depth, control, node_counter);
+                    run_helper(thread_id, tt, board, max_depth, control, node_counter, history);
                 });
             }
 
             // Thread 0 runs on this thread (the coordinator)
-            result = self.search_main(board, max_depth, control, &mut on_iter, &node_counters[0]);
+            result = self.search_main(board, max_depth, control, history, &mut on_iter, &node_counters[0]);
         });
         // scope auto-joins all helpers here
 
@@ -106,6 +108,7 @@ impl ThreadPool {
         board: &Board,
         max_depth: u8,
         control: &SearchControl,
+        history: &[u64],
         mut on_iter: F,
     ) -> SearchResult
     where
@@ -117,7 +120,8 @@ impl ThreadPool {
             pv: PvTable::new(),
             control,
             killers: KillerTable::new(),
-            history: HistoryTable::new(),
+            history_table: HistoryTable::new(),
+            history: history.to_vec(),
         };
 
         let mut completed_move = Move::NULL;
@@ -125,6 +129,7 @@ impl ThreadPool {
         let mut completed_depth: u8 = 0;
         let mut completed_pv: Vec<Move> = Vec::new();
         let mut prev_score: i32 = 0;
+        let mut stability = StabilityTracker::new();
 
         for depth in 1..=max_depth {
             if control.should_stop_iterating() {
@@ -148,6 +153,9 @@ impl ThreadPool {
             completed_pv = pv.iter().copied().filter(|m| !m.is_null()).collect();
 
             on_iter(depth, score, ctx.nodes, &completed_pv);
+
+            let scale = stability.update(completed_move, score);
+            control.update_soft_scale(scale);
         }
 
         let ponder_move = if completed_pv.len() > 1 {
@@ -176,6 +184,7 @@ impl ThreadPool {
         board: &Board,
         max_depth: u8,
         control: &SearchControl,
+        history: &[u64],
         on_iter: &mut F,
         node_counter: &AtomicU64,
     ) -> SearchResult
@@ -188,7 +197,8 @@ impl ThreadPool {
             pv: PvTable::new(),
             control,
             killers: KillerTable::new(),
-            history: HistoryTable::new(),
+            history_table: HistoryTable::new(),
+            history: history.to_vec(),
         };
 
         let mut completed_move = Move::NULL;
@@ -196,6 +206,7 @@ impl ThreadPool {
         let mut completed_depth: u8 = 0;
         let mut completed_pv: Vec<Move> = Vec::new();
         let mut prev_score: i32 = 0;
+        let mut stability = StabilityTracker::new();
 
         for depth in 1..=max_depth {
             if control.should_stop_iterating() {
@@ -219,6 +230,9 @@ impl ThreadPool {
             completed_pv = pv.iter().copied().filter(|m| !m.is_null()).collect();
 
             on_iter(depth, score, ctx.nodes, &completed_pv);
+
+            let scale = stability.update(completed_move, score);
+            control.update_soft_scale(scale);
         }
 
         node_counter.store(ctx.nodes, Ordering::Relaxed);
@@ -252,6 +266,7 @@ fn run_helper(
     max_depth: u8,
     control: &SearchControl,
     node_counter: &AtomicU64,
+    history: &[u64],
 ) {
     let mut ctx = SearchContext {
         nodes: 0,
@@ -259,7 +274,8 @@ fn run_helper(
         pv: PvTable::new(),
         control,
         killers: KillerTable::new(),
-        history: HistoryTable::new(),
+        history_table: HistoryTable::new(),
+        history: history.to_vec(),
     };
 
     // Depth offset: helpers start at different depths to increase search divergence.
