@@ -21,6 +21,15 @@ pub const MATE_THRESHOLD: i32 = 28_000;
 /// Maximum search depth (in plies) for array sizing and recursion limits.
 pub const MAX_PLY: usize = 128;
 
+/// Maximum depth for futility pruning.
+const FUTILITY_DEPTH: u8 = 3;
+
+/// Forward futility margins indexed by depth.
+const FUTILITY_MARGIN: [i32; 4] = [0, 200, 450, 700];
+
+/// Reverse futility pruning margins indexed by depth.
+const RFP_MARGIN: [i32; 4] = [0, 200, 450, 700];
+
 /// Negamax alpha-beta search.
 ///
 /// Returns the best score for the side to move. The principal
@@ -62,8 +71,10 @@ pub(super) fn negamax(
 
     // Probe transposition table
     let mut tt_move = Move::NULL;
+    let mut tt_eval: i32 = 0;
     if let Some(tt_entry) = ctx.tt.probe(board.hash(), ply) {
         tt_move = tt_entry.best_move;
+        tt_eval = tt_entry.eval;
         // Cutoff if the stored depth is sufficient
         if tt_entry.depth >= depth {
             let cutoff = match tt_entry.bound {
@@ -128,6 +139,19 @@ pub(super) fn negamax(
         };
     }
 
+    // Static eval for pruning decisions — prefer TT eval if available
+    let static_eval = if tt_eval != 0 { tt_eval } else { evaluate(board) };
+
+    // --- Reverse Futility Pruning ---
+    // If our static eval is so far above beta that even subtracting a margin
+    // keeps it above, the opponent likely can't improve enough. Return early.
+    if !in_check && depth >= 1 && depth <= FUTILITY_DEPTH
+        && beta.abs() < MATE_THRESHOLD
+        && static_eval - RFP_MARGIN[depth as usize] >= beta
+    {
+        return static_eval;
+    }
+
     let original_alpha = alpha;
     let mut best_score = -INF;
     let mut best_move = Move::NULL;
@@ -137,7 +161,21 @@ pub(super) fn negamax(
     let mut move_count: usize = 0;
 
     while let Some(mv) = picker.pick_next() {
-        // Track quiet moves for history penalty on cutoff
+        // Compute tactical status before make_move (only reads pre-move board)
+        let is_tactical = board.piece_on(mv.dest()).is_some()
+            || mv.kind() == MoveKind::EnPassant
+            || mv.kind() == MoveKind::Promotion;
+
+        // --- Forward Futility Pruning ---
+        // If the static eval + a margin cannot reach alpha, skip this move.
+        if !in_check && depth <= FUTILITY_DEPTH && !is_tactical
+            && move_count > 0 && alpha.abs() < MATE_THRESHOLD
+            && static_eval + FUTILITY_MARGIN[depth as usize] <= alpha
+        {
+            continue;
+        }
+
+        // Track quiet moves for history penalty on cutoff (after pruning)
         let is_quiet_move = mv.kind() == MoveKind::Normal && board.piece_on(mv.dest()).is_none();
         if is_quiet_move && quiet_count < 64 {
             searched_quiets[quiet_count] = mv;
@@ -152,24 +190,36 @@ pub(super) fn negamax(
         // would immediately match itself).
         ctx.history.push(board.hash());
 
-        // --- Late Move Reductions (LMR) ---
-        let is_tactical = board.piece_on(mv.dest()).is_some()
-            || mv.kind() == MoveKind::EnPassant
-            || mv.kind() == MoveKind::Promotion;
-
+        // --- PVS + LMR ---
         let mut score;
-        if depth >= 3 && move_count >= 4 && !is_tactical && !in_check {
+        if move_count == 1 {
+            // PV move: full window, full depth
+            score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+        } else if depth >= 3 && move_count >= 4 && !is_tactical && !in_check {
+            // LMR + PVS: three-step cascade
             let r: u8 = if move_count >= 7 { 2 } else { 1 };
             let reduced_depth = depth.saturating_sub(1 + r);
-            // Reduced-depth search with full window
-            score = -negamax(&child, reduced_depth, ply + 1, -beta, -alpha, true, ctx);
 
-            // Re-search at full depth if the reduced search improved alpha
+            // Step 1: reduced depth + null window
+            score = -negamax(&child, reduced_depth, ply + 1, -alpha - 1, -alpha, true, ctx);
+
+            // Step 2: full depth + null window (verify LMR fail-high)
+            if score > alpha {
+                score = -negamax(&child, depth - 1, ply + 1, -alpha - 1, -alpha, true, ctx);
+            }
+
+            // Step 3: full depth + full window (get exact score)
             if score > alpha {
                 score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
             }
         } else {
-            score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+            // Non-PV, non-LMR: null window
+            score = -negamax(&child, depth - 1, ply + 1, -alpha - 1, -alpha, true, ctx);
+
+            // Re-search with full window if null window failed high
+            if score > alpha {
+                score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+            }
         }
 
         // Pop child position hash after recursion
@@ -218,7 +268,7 @@ pub(super) fn negamax(
     } else {
         best_move
     };
-    ctx.tt.store(board.hash(), depth, best_score, 0, store_move, bound, ply);
+    ctx.tt.store(board.hash(), depth, best_score, static_eval, store_move, bound, ply);
 
     best_score
 }
