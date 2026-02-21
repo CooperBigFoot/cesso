@@ -80,40 +80,43 @@ pub(super) fn negamax(
         }
     }
 
+    // Compute check status once — used for extensions, NMP, and stalemate
+    let king_sq = board.king_square(board.side_to_move());
+    let in_check = board.is_square_attacked(king_sq, !board.side_to_move());
+
+    // Check extension: extend search by one ply when in check
+    let depth = if in_check && (ply as usize) < MAX_PLY - 1 {
+        depth + 1
+    } else {
+        depth
+    };
+
     // Leaf node — drop into quiescence search
     if depth == 0 {
         return qsearch(board, ply, alpha, beta, ctx);
     }
 
     // --- Null Move Pruning ---
-    if do_null && ply > 0 && depth >= 3 && beta.abs() < MATE_THRESHOLD {
-        let king_sq = board.king_square(board.side_to_move());
-        let in_check = board.is_square_attacked(king_sq, !board.side_to_move());
-        if !in_check {
-            let r = if depth >= 6 { 3 } else { 2 };
-            let null_board = board.make_null_move();
-            ctx.history.push(board.hash());
-            let null_score = -negamax(
-                &null_board,
-                depth.saturating_sub(1 + r),
-                ply + 1,
-                -beta,
-                -beta + 1,
-                false,
-                ctx,
-            );
-            ctx.history.pop();
-            if null_score >= beta {
-                return beta;
-            }
+    if do_null && ply > 0 && depth >= 3 && beta.abs() < MATE_THRESHOLD && !in_check {
+        let r = if depth >= 6 { 3 } else { 2 };
+        let null_board = board.make_null_move();
+        ctx.history.push(board.hash());
+        let null_score = -negamax(
+            &null_board,
+            depth.saturating_sub(1 + r),
+            ply + 1,
+            -beta,
+            -beta + 1,
+            false,
+            ctx,
+        );
+        ctx.history.pop();
+        if null_score >= beta {
+            return beta;
         }
     }
 
     let moves = generate_legal_moves(board);
-
-    // Detect check once — used for stalemate/checkmate and LMR guard
-    let king_sq = board.king_square(board.side_to_move());
-    let in_check = board.is_square_attacked(king_sq, !board.side_to_move());
 
     // No legal moves: checkmate or stalemate
     if moves.is_empty() {
