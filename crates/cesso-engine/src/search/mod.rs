@@ -4,7 +4,7 @@ pub mod negamax;
 pub mod ordering;
 pub mod tt;
 
-use cesso_core::{Board, Move};
+use cesso_core::{Board, Move, generate_legal_moves};
 
 use negamax::{negamax, INF};
 use tt::TranspositionTable;
@@ -75,6 +75,10 @@ impl Searcher {
                 &mut self.tt,
             );
             best_score = score;
+            debug_assert!(
+                !self.best_move.is_null() || generate_legal_moves(board).is_empty(),
+                "negamax returned without setting root_best_move at depth {depth}"
+            );
             on_iter(depth, score, self.nodes, self.best_move);
         }
 
@@ -167,5 +171,61 @@ mod tests {
             depths_seen.push(depth);
         });
         assert_eq!(depths_seen, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn on_iter_never_emits_null_move() {
+        let board = Board::starting_position();
+        let mut searcher = Searcher::new();
+        searcher.search(&board, 4, |_d, _score, _nodes, best_move| {
+            assert!(
+                !best_move.is_null(),
+                "on_iter callback received Move::NULL"
+            );
+        });
+    }
+
+    #[test]
+    fn repeated_search_no_null_leak() {
+        let board = Board::starting_position();
+        let mut searcher = Searcher::new();
+        // First search warms the TT
+        searcher.search(&board, 3, |_d, _score, _nodes, best_move| {
+            assert!(
+                !best_move.is_null(),
+                "null move in first search callback"
+            );
+        });
+        // Second search probes the warm TT
+        searcher.search(&board, 3, |_d, _score, _nodes, best_move| {
+            assert!(
+                !best_move.is_null(),
+                "null move in second search callback (warm TT)"
+            );
+        });
+    }
+
+    #[test]
+    fn stalemate_result_is_null() {
+        // Black king on a8, white king on c7, white queen on b6 — black to move, stalemate
+        let board: Board = "k7/2K5/1Q6/8/8/8/8/8 b - - 0 1".parse().unwrap();
+        let mut searcher = Searcher::new();
+        let result = searcher.search(&board, 1, |_, _, _, _| {});
+        assert!(
+            result.best_move.is_null(),
+            "stalemate should produce null best_move"
+        );
+    }
+
+    #[test]
+    fn checkmate_result_is_null() {
+        // Black king on h8, white queen on g7, white king on f6 — black to move, checkmated
+        let board: Board = "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1".parse().unwrap();
+        let mut searcher = Searcher::new();
+        let result = searcher.search(&board, 1, |_, _, _, _| {});
+        assert!(
+            result.best_move.is_null(),
+            "checkmate should produce null best_move"
+        );
     }
 }

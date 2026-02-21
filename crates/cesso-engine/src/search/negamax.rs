@@ -52,10 +52,15 @@ pub(super) fn negamax(
                 Bound::None => false,
             };
             if cutoff {
-                if ply == 0 && !tt_entry.best_move.is_null() {
-                    *root_best_move = tt_entry.best_move;
+                if ply == 0 {
+                    if !tt_entry.best_move.is_null() {
+                        *root_best_move = tt_entry.best_move;
+                        return tt_entry.score;
+                    }
+                    // No valid move in TT entry — fall through to search
+                } else {
+                    return tt_entry.score;
                 }
-                return tt_entry.score;
             }
         }
     }
@@ -113,7 +118,12 @@ pub(super) fn negamax(
         Bound::Exact
     };
 
-    tt.store(board.hash(), depth, best_score, 0, best_move, bound, ply);
+    let store_move = if bound == Bound::UpperBound && best_move.is_null() {
+        tt_move // preserve ordering hint from prior entry
+    } else {
+        best_move
+    };
+    tt.store(board.hash(), depth, best_score, 0, store_move, bound, ply);
 
     best_score
 }

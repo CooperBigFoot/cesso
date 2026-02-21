@@ -76,12 +76,20 @@ impl UciEngine {
 
     fn handle_go_depth(&mut self, depth: u8) {
         let result = self.searcher.search(&self.board, depth, |d, score, nodes, best_move| {
-            println!(
-                "info depth {} score cp {} nodes {} pv {}",
-                d, score, nodes, best_move.to_uci()
-            );
+            if best_move.is_null() {
+                println!("info depth {} score cp {} nodes {}", d, score, nodes);
+            } else {
+                println!(
+                    "info depth {} score cp {} nodes {} pv {}",
+                    d, score, nodes, best_move.to_uci()
+                );
+            }
         });
-        println!("bestmove {}", result.best_move.to_uci());
+        if result.best_move.is_null() {
+            println!("bestmove 0000");
+        } else {
+            println!("bestmove {}", result.best_move.to_uci());
+        }
     }
 }
 
