@@ -14,13 +14,13 @@ use crate::eval::score::{Score, S};
 /// For each file index 0–7, the bitboard of the adjacent files.
 ///
 /// File A → FILE_B only; File H → FILE_G only; all others get both neighbours.
-static ADJACENT_FILES: [Bitboard; 8] = compute_adjacent_files();
+pub(crate) static ADJACENT_FILES: [Bitboard; 8] = compute_adjacent_files();
 
 /// For each `[color][square]`, the mask of squares ahead of the pawn on the
 /// same file and adjacent files.
 ///
 /// A pawn is passed if `PASSED_PAWN_MASK[color][sq] & enemy_pawns` is empty.
-static PASSED_PAWN_MASK: [[Bitboard; 64]; 2] = compute_passed_pawn_masks();
+pub(crate) static PASSED_PAWN_MASK: [[Bitboard; 64]; 2] = compute_passed_pawn_masks();
 
 const fn compute_adjacent_files() -> [Bitboard; 8] {
     let mut table = [Bitboard::EMPTY; 8];
@@ -111,6 +111,10 @@ const DOUBLED_PAWN_PENALTY: Score = S(-10, -15);
 
 /// Penalty for a backward pawn.
 const BACKWARD_PAWN_PENALTY: Score = S(-15, -10);
+
+/// Bonus for a pawn that is directly supported by another friendly pawn
+/// (connected pawns on adjacent files, same or +1 rank).
+const CONNECTED_PAWN_BONUS: Score = S(5, 8);
 
 // ---------------------------------------------------------------------------
 // Public evaluation entry point
@@ -222,6 +226,14 @@ fn evaluate_pawns_for_side(
                     score += BACKWARD_PAWN_PENALTY;
                 }
             }
+        }
+
+        // --- Connected pawn ---
+        // A pawn is connected if a friendly pawn on an adjacent file attacks it
+        // (i.e., is on the same rank or one rank behind and on an adjacent file).
+        let supporters = pawn_attacks(!color, sq) & friendly_pawns;
+        if supporters.is_nonempty() {
+            score += CONNECTED_PAWN_BONUS;
         }
     }
 

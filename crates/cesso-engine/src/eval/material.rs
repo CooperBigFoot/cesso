@@ -60,6 +60,38 @@ pub fn material(board: &Board) -> Score {
     score
 }
 
+/// Evaluate bishop vs knight balance based on pawn structure (open/closed position).
+///
+/// Bishops are stronger in open positions (fewer pawns), knights in closed positions
+/// (more pawns). This adjusts the material score accordingly.
+pub fn bishop_knight_balance(board: &Board) -> Score {
+    /// Bonus per bishop in an open position (few pawns).
+    const BISHOP_OPEN_POSITION_BONUS: Score = S(15, 10);
+    /// Bonus per knight in a closed position (many pawns).
+    const KNIGHT_CLOSED_POSITION_BONUS: Score = S(10, 5);
+
+    /// Threshold: 10 or fewer pawns = open, more = closed.
+    const OPEN_THRESHOLD: u32 = 10;
+
+    let total_pawns = board.pieces(PieceKind::Pawn).count();
+    let mut score = Score::ZERO;
+
+    let white_bishops = (board.pieces(PieceKind::Bishop) & board.side(Color::White)).count() as i16;
+    let black_bishops = (board.pieces(PieceKind::Bishop) & board.side(Color::Black)).count() as i16;
+    let white_knights = (board.pieces(PieceKind::Knight) & board.side(Color::White)).count() as i16;
+    let black_knights = (board.pieces(PieceKind::Knight) & board.side(Color::Black)).count() as i16;
+
+    if total_pawns <= OPEN_THRESHOLD {
+        // Open position: bishops are better
+        score += BISHOP_OPEN_POSITION_BONUS * (white_bishops - black_bishops);
+    } else {
+        // Closed position: knights are better
+        score += KNIGHT_CLOSED_POSITION_BONUS * (white_knights - black_knights);
+    }
+
+    score
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

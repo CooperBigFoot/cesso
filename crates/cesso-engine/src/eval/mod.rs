@@ -10,20 +10,27 @@
 pub mod king_safety;
 pub mod material;
 pub mod mobility;
+pub mod outposts;
 pub mod pawns;
 pub mod phase;
 pub mod pst;
+pub mod rooks;
 pub mod score;
 
 use cesso_core::{Board, Color, PieceKind};
 
 use self::king_safety::evaluate_king_safety;
-use self::material::material;
+use self::material::{bishop_knight_balance, material};
 use self::mobility::evaluate_mobility;
+use self::outposts::evaluate_outposts;
 use self::pawns::evaluate_pawns;
 use self::phase::{game_phase, MAX_PHASE};
 use self::pst::pst_value;
-use self::score::Score;
+use self::rooks::evaluate_rooks;
+use self::score::{Score, S};
+
+/// Small tempo bonus for the side to move.
+const TEMPO: Score = S(15, 5);
 
 /// Evaluate the board position and return a centipawn score from the
 /// side-to-move's perspective (positive = good for the side to move).
@@ -32,14 +39,17 @@ use self::score::Score;
 /// 1. Computes all terms from White's perspective as packed [`Score`] values.
 /// 2. Tapers the combined mg/eg values using the game phase.
 /// 3. Flips the sign when Black is to move.
+/// 4. Adds a tempo bonus for the side to move.
 pub fn evaluate(board: &Board) -> i32 {
     let white_score = evaluate_white(board);
     let phase = game_phase(board);
     let tapered = taper(white_score, phase);
 
+    // Add tempo bonus for the side to move
+    let tempo = taper(TEMPO, phase);
     match board.side_to_move() {
-        Color::White => tapered,
-        Color::Black => -tapered,
+        Color::White => tapered + tempo,
+        Color::Black => -tapered + tempo,
     }
 }
 
@@ -54,16 +64,19 @@ fn taper(score: Score, phase: i32) -> i32 {
 
 /// Compute the total evaluation from White's perspective as a packed Score.
 ///
-/// Sums material, piece-square tables, pawn structure, mobility, and
-/// king safety.
+/// Sums material, piece-square tables, pawn structure, mobility, king safety,
+/// rook placement, and outpost bonuses.
 fn evaluate_white(board: &Board) -> Score {
     let mut score = Score::ZERO;
 
     score += material(board);
+    score += bishop_knight_balance(board);
     score += pst_total(board);
     score += evaluate_pawns(board);
     score += evaluate_mobility(board);
     score += evaluate_king_safety(board);
+    score += evaluate_rooks(board);
+    score += evaluate_outposts(board);
 
     score
 }
