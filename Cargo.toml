@@ -1,6 +1,6 @@
 [package]
 name = "cesso"
-version = "0.1.32"
+version = "0.1.33"
 edition = "2024"
 
 [dependencies]
@@ -17,3 +17,4 @@ members = [
     "crates/cesso-engine",
     "crates/cesso-uci",
 ]
+exclude = ["train"]

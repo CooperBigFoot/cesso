@@ -1,0 +1,8 @@
+[package]
+name = "cesso-train"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+
+[dependencies]
+bullet_lib = { git = "https://github.com/jw1912/bullet.git" }
