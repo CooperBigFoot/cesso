@@ -21,3 +21,6 @@ desktop.ini
 # Chess data (tablebases, opening books) — too large for git
 /data/*
 !/data/README.md
+
+scratchpad/
+sratchpad/
