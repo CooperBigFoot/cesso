@@ -1,6 +1,7 @@
 //! Search algorithms and move ordering.
 
 pub mod control;
+pub mod draw;
 pub mod heuristics;
 pub mod negamax;
 pub mod ordering;
@@ -8,7 +9,7 @@ pub mod pool;
 pub mod see;
 pub mod tt;
 
-use cesso_core::{Board, Move, generate_legal_moves};
+use cesso_core::{Board, Color, Move, generate_legal_moves};
 
 use control::SearchControl;
 use heuristics::{HistoryTable, KillerTable};
@@ -140,6 +141,8 @@ impl Searcher {
         max_depth: u8,
         control: &SearchControl,
         history: &[u64],
+        contempt: i32,
+        engine_color: Color,
         mut on_iter: F,
     ) -> SearchResult
     where
@@ -175,6 +178,8 @@ impl Searcher {
             killers: KillerTable::new(),
             history_table: HistoryTable::new(),
             history: history.to_vec(),
+            contempt,
+            engine_color,
         };
 
         // Track completed iteration results (for abort-safety)
@@ -264,7 +269,7 @@ mod tests {
     fn search_depth(searcher: &Searcher, board: &Board, depth: u8) -> SearchResult {
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
-        searcher.search(board, depth, &control, &[], |_, _, _, _| {})
+        searcher.search(board, depth, &control, &[], 0, Color::White, |_, _, _, _| {})
     }
 
     #[test]
@@ -324,7 +329,7 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
         let mut depths_seen = Vec::new();
-        searcher.search(&board, 3, &control, &[], |depth, _, _, _| {
+        searcher.search(&board, 3, &control, &[], 0, Color::White, |depth, _, _, _| {
             depths_seen.push(depth);
         });
         assert_eq!(depths_seen, vec![1, 2, 3]);
@@ -336,7 +341,7 @@ mod tests {
         let searcher = Searcher::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
-        searcher.search(&board, 4, &control, &[], |_d, _score, _nodes, pv| {
+        searcher.search(&board, 4, &control, &[], 0, Color::White, |_d, _score, _nodes, pv| {
             assert!(
                 !pv.is_empty() && !pv[0].is_null(),
                 "on_iter callback received empty PV or Move::NULL"
@@ -351,7 +356,7 @@ mod tests {
         // First search warms the TT
         let stopped1 = Arc::new(AtomicBool::new(false));
         let control1 = SearchControl::new_infinite(stopped1);
-        searcher.search(&board, 3, &control1, &[], |_d, _score, _nodes, pv| {
+        searcher.search(&board, 3, &control1, &[], 0, Color::White, |_d, _score, _nodes, pv| {
             assert!(
                 !pv.is_empty() && !pv[0].is_null(),
                 "null move in first search callback"
@@ -360,7 +365,7 @@ mod tests {
         // Second search probes the warm TT
         let stopped2 = Arc::new(AtomicBool::new(false));
         let control2 = SearchControl::new_infinite(stopped2);
-        searcher.search(&board, 3, &control2, &[], |_d, _score, _nodes, pv| {
+        searcher.search(&board, 3, &control2, &[], 0, Color::White, |_d, _score, _nodes, pv| {
             assert!(
                 !pv.is_empty() && !pv[0].is_null(),
                 "null move in second search callback (warm TT)"
@@ -442,7 +447,7 @@ mod tests {
 
         // Stop after depth 1 callback fires
         let stop_clone = Arc::clone(&stopped);
-        let result = searcher.search(&board, 128, &control, &[], |depth, _, _, _| {
+        let result = searcher.search(&board, 128, &control, &[], 0, Color::White, |depth, _, _, _| {
             if depth >= 1 {
                 stop_clone.store(true, Ordering::Release);
             }
@@ -501,7 +506,7 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
         let mut depths_seen = Vec::new();
-        searcher.search(&board, 6, &control, &[], |depth, _, _, _| {
+        searcher.search(&board, 6, &control, &[], 0, Color::White, |depth, _, _, _| {
             depths_seen.push(depth);
         });
         assert_eq!(depths_seen, vec![1, 2, 3, 4, 5, 6], "aspiration should not skip depths");
@@ -530,13 +535,13 @@ mod tests {
         // First do a normal depth-2 search to get a baseline
         let stopped2 = Arc::new(AtomicBool::new(false));
         let control2 = SearchControl::new_infinite(stopped2);
-        let baseline = searcher.search(&board, 2, &control2, &[], |_, _, _, _| {});
+        let baseline = searcher.search(&board, 2, &control2, &[], 0, Color::White, |_, _, _, _| {});
         assert!(!baseline.best_move.is_null());
 
         // Now set stop immediately and search to depth 100
         stopped.store(true, Ordering::Release);
         let searcher2 = Searcher::new();
-        let result = searcher2.search(&board, 100, &control, &[], |_, _, _, _| {});
+        let result = searcher2.search(&board, 100, &control, &[], 0, Color::White, |_, _, _, _| {});
 
         // With stop set immediately, depth 0 means no iteration completed
         // The best_move should be NULL (no completed iterations)
@@ -648,7 +653,7 @@ mod tests {
         let searcher = Searcher::new();
         let stopped = Arc::new(AtomicBool::new(false));
         let control = SearchControl::new_infinite(stopped);
-        let result = searcher.search(&b4, 6, &control, &history, |_, _, _, _| {});
+        let result = searcher.search(&b4, 6, &control, &history, 0, Color::White, |_, _, _, _| {});
         // With repetition detected, the score should be near zero (draw)
         assert!(
             result.score.abs() <= 100,

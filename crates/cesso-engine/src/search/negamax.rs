@@ -1,6 +1,6 @@
 //! Negamax alpha-beta search with quiescence.
 
-use cesso_core::{Board, Move, MoveKind, generate_legal_moves};
+use cesso_core::{Board, Color, Move, MoveKind, generate_legal_moves};
 
 use crate::evaluate;
 use crate::search::control::SearchControl;
@@ -59,7 +59,7 @@ pub(super) fn negamax(
 
     // Fifty-move rule draw
     if board.halfmove_clock() >= 100 {
-        return 0;
+        return ctx.draw_score(board);
     }
 
     // Repetition detection (twofold repetition = draw in search)
@@ -70,7 +70,7 @@ pub(super) fn negamax(
         let lookback = hmc.min(len);
         for i in (len.saturating_sub(lookback)..len).rev() {
             if ctx.history[i] == hash {
-                return 0;
+                return ctx.draw_score(board);
             }
         }
     }
@@ -141,7 +141,7 @@ pub(super) fn negamax(
         return if in_check {
             -(MATE_SCORE - ply as i32)
         } else {
-            0
+            ctx.draw_score(board)
         };
     }
 
@@ -366,7 +366,7 @@ fn qsearch(
 
     // Fifty-move rule draw
     if board.halfmove_clock() >= 100 {
-        return 0;
+        return ctx.draw_score(board);
     }
 
     // Stand-pat: the side to move can choose not to capture
@@ -498,4 +498,23 @@ pub(super) struct SearchContext<'a> {
     /// Zobrist hashes of positions visited during this search (for repetition detection).
     /// Grows/shrinks with the search stack via push/pop.
     pub history: Vec<u64>,
+    /// Contempt factor in centipawns — biases draw evaluation.
+    pub contempt: i32,
+    /// The color the engine is playing (for contempt sign).
+    pub engine_color: Color,
+}
+
+impl SearchContext<'_> {
+    /// Contempt-aware draw score for negamax.
+    ///
+    /// When the engine is to move, a draw scores `-contempt` (bad when
+    /// contempt > 0). When the opponent is to move, it scores `+contempt`.
+    #[inline]
+    fn draw_score(&self, board: &Board) -> i32 {
+        if board.side_to_move() == self.engine_color {
+            -self.contempt
+        } else {
+            self.contempt
+        }
+    }
 }

@@ -10,3 +10,4 @@ pub use search::control::SearchControl;
 pub use search::pool::ThreadPool;
 pub use search::{SearchResult, Searcher};
 pub use time::limits_from_go;
+pub use search::draw::{DrawDecision, decide_draw};

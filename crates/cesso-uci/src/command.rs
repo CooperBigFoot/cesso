@@ -42,6 +42,8 @@ pub enum UciOption {
     Threads(u16),
     /// Enable or disable pondering.
     Ponder(bool),
+    /// Contempt factor in centipawns, clamped to [-300, 300].
+    Contempt(i32),
 }
 
 /// Board position with game history for repetition detection.
@@ -75,6 +77,8 @@ pub enum Command {
     Stop,
     /// `quit` -- exit the engine.
     Quit,
+    /// `draw` -- opponent offers or claims a draw.
+    Draw,
     /// Unrecognized command (silently ignored per UCI spec).
     Unknown(String),
 }
@@ -96,6 +100,7 @@ pub fn parse_command(line: &str) -> Result<Command, UciError> {
         "position" => parse_position(&tokens[1..]),
         "go" => parse_go(&tokens[1..]),
         "setoption" => parse_setoption(&tokens[1..]),
+        "draw" => Ok(Command::Draw),
         _ => Ok(Command::Unknown(tokens[0].to_string())),
     }
 }
@@ -274,6 +279,18 @@ fn parse_setoption(tokens: &[&str]) -> Result<Command, UciError> {
                 }
             };
             Ok(Command::SetOption(UciOption::Ponder(enabled)))
+        }
+        "contempt" => {
+            let raw = value_token.ok_or_else(|| UciError::InvalidOptionValue {
+                name: "Contempt".to_string(),
+                value: String::new(),
+            })?;
+            let parsed: i32 = raw.parse().map_err(|_| UciError::InvalidOptionValue {
+                name: "Contempt".to_string(),
+                value: raw.to_string(),
+            })?;
+            let clamped = parsed.clamp(-300, 300);
+            Ok(Command::SetOption(UciOption::Contempt(clamped)))
         }
         _ => Ok(Command::Unknown(name)),
     }
@@ -571,5 +588,34 @@ mod tests {
             }
             _ => panic!("expected Position"),
         }
+    }
+
+    #[test]
+    fn parse_draw() {
+        assert!(matches!(parse_command("draw").unwrap(), Command::Draw));
+    }
+
+    #[test]
+    fn parse_setoption_contempt() {
+        let cmd = parse_command("setoption name Contempt value 50").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Contempt(50))));
+    }
+
+    #[test]
+    fn parse_setoption_contempt_negative() {
+        let cmd = parse_command("setoption name Contempt value -100").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Contempt(-100))));
+    }
+
+    #[test]
+    fn parse_setoption_contempt_clamped_high() {
+        let cmd = parse_command("setoption name Contempt value 999").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Contempt(300))));
+    }
+
+    #[test]
+    fn parse_setoption_contempt_clamped_low() {
+        let cmd = parse_command("setoption name Contempt value -999").unwrap();
+        assert!(matches!(cmd, Command::SetOption(UciOption::Contempt(-300))));
     }
 }

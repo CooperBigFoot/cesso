@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use cesso_core::Board;
+use cesso_core::{Board, Color};
 use cesso_engine::{SearchControl, SearchResult, ThreadPool};
 
 const SCHOLARS_MATE_FEN: &str =
@@ -27,7 +27,7 @@ fn search_with_threads(board: &Board, depth: u8, threads: usize) -> SearchResult
     pool.set_num_threads(threads);
     let stopped = Arc::new(AtomicBool::new(false));
     let control = SearchControl::new_infinite(stopped);
-    pool.search(board, depth, &control, &[], |_, _, _, _| {})
+    pool.search(board, depth, &control, &[], 0, Color::White, |_, _, _, _| {})
 }
 
 // ── Basic correctness ─────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ fn stop_signal_terminates_all_threads() {
 
     // Stop after depth 1 callback fires
     let stop_clone = Arc::clone(&stopped);
-    let result = pool.search(&board, 128, &control, &[], |depth, _, _, _| {
+    let result = pool.search(&board, 128, &control, &[], 0, Color::White, |depth, _, _, _| {
         if depth >= 1 {
             stop_clone.store(true, Ordering::Release);
         }
@@ -150,7 +150,7 @@ fn pre_set_stop_returns_immediately() {
     let stopped = Arc::new(AtomicBool::new(true));
     let control = SearchControl::new_infinite(Arc::clone(&stopped));
 
-    let result = pool.search(&board, 100, &control, &[], |_, _, _, _| {});
+    let result = pool.search(&board, 100, &control, &[], 0, Color::White, |_, _, _, _| {});
 
     assert_eq!(
         result.depth, 0,
@@ -211,7 +211,7 @@ fn on_iter_callback_fires() {
     let control = SearchControl::new_infinite(stopped);
 
     let mut depths_seen: Vec<u8> = Vec::new();
-    pool.search(&board, 3, &control, &[], |depth, _, _, _| {
+    pool.search(&board, 3, &control, &[], 0, Color::White, |depth, _, _, _| {
         depths_seen.push(depth);
     });
 

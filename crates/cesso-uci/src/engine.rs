@@ -7,7 +7,8 @@ use std::sync::{Arc, mpsc};
 use tracing::{debug, info, warn};
 
 use cesso_core::Board;
-use cesso_engine::{SearchControl, SearchResult, ThreadPool, limits_from_go};
+use cesso_engine::{DrawDecision, SearchControl, SearchResult, ThreadPool, decide_draw, limits_from_go};
+use cesso_engine::eval::phase::game_phase;
 
 use crate::command::{GoParams, UciOption, parse_command, Command, PositionInfo};
 use crate::error::UciError;
@@ -18,6 +19,8 @@ struct EngineConfig {
     hash_mb: u32,
     /// Number of search threads.
     threads: u16,
+    /// Contempt factor in centipawns — positive values make the engine avoid draws.
+    contempt: i32,
 }
 
 impl Default for EngineConfig {
@@ -25,6 +28,7 @@ impl Default for EngineConfig {
         Self {
             hash_mb: 16,
             threads: 1,
+            contempt: 0,
         }
     }
 }
@@ -61,6 +65,8 @@ pub struct UciEngine {
     stop_flag: Arc<AtomicBool>,
     control: Option<Arc<SearchControl>>,
     config: EngineConfig,
+    /// Whether the opponent has offered a draw (set by `Command::Draw`).
+    opponent_draw_offer: bool,
     pending_clear_tt: bool,
     /// Pending TT resize (MB) to apply when the search thread returns the pool.
     pending_resize_tt: Option<u32>,
@@ -77,6 +83,7 @@ impl UciEngine {
             stop_flag: Arc::new(AtomicBool::new(false)),
             control: None,
             config: EngineConfig::default(),
+            opponent_draw_offer: false,
             pending_clear_tt: false,
             pending_resize_tt: None,
         }
@@ -138,6 +145,9 @@ impl UciEngine {
                         }
                         break;
                     }
+                    Command::Draw => {
+                        self.opponent_draw_offer = true;
+                    }
                     Command::Unknown(_) => {}
                 },
                 EngineEvent::UciCommand(Err(e)) => {
@@ -160,6 +170,7 @@ impl UciEngine {
         println!("option name Hash type spin default 16 min 1 max 65536");
         println!("option name Threads type spin default 1 min 1 max 256");
         println!("option name Ponder type check default false");
+        println!("option name Contempt type spin default 0 min -300 max 300");
         println!("uciok");
     }
 
@@ -176,6 +187,7 @@ impl UciEngine {
             // Search thread owns the pool — defer clear until it comes back
             self.pending_clear_tt = true;
         }
+        self.opponent_draw_offer = false;
     }
 
     fn handle_setoption(&mut self, option: UciOption) {
@@ -196,6 +208,9 @@ impl UciEngine {
             }
             UciOption::Ponder(_) => {
                 // Ponder option acknowledged — actual pondering is handled by the go ponder protocol
+            }
+            UciOption::Contempt(cp) => {
+                self.config.contempt = cp;
             }
         }
     }
@@ -238,9 +253,11 @@ impl UciEngine {
         let history = self.history.clone();
         let search_control = Arc::clone(&control);
         let tx = tx.clone();
+        let contempt = self.config.contempt;
+        let engine_color = self.board.side_to_move();
 
         std::thread::spawn(move || {
-            let result = pool.search(&board, max_depth, &search_control, &history, |d, score, nodes, pv| {
+            let result = pool.search(&board, max_depth, &search_control, &history, contempt, engine_color, |d, score, nodes, pv| {
                 let elapsed = search_control.elapsed();
                 let elapsed_ms = elapsed.as_millis().max(1);
                 let nps = (nodes as u128 * 1000) / elapsed_ms;
@@ -299,19 +316,36 @@ impl UciEngine {
         self.control = None;
 
         let result = &done.result;
+
+        // Evaluate draw decision
+        let draw_decision = decide_draw(
+            result.score,
+            self.config.contempt,
+            game_phase(&self.board),
+            self.opponent_draw_offer,
+        );
+        self.opponent_draw_offer = false; // consume regardless of decision
+
+        let draw_suffix = if matches!(draw_decision, DrawDecision::Accept | DrawDecision::Offer) {
+            " draw"
+        } else {
+            ""
+        };
+
         if result.best_move.is_null() {
             println!("bestmove 0000");
         } else {
             match result.ponder_move {
                 Some(pm) if !pm.is_null() => {
                     println!(
-                        "bestmove {} ponder {}",
+                        "bestmove {} ponder {}{}",
                         result.best_move.to_uci(),
-                        pm.to_uci()
+                        pm.to_uci(),
+                        draw_suffix,
                     );
                 }
                 _ => {
-                    println!("bestmove {}", result.best_move.to_uci());
+                    println!("bestmove {}{}", result.best_move.to_uci(), draw_suffix);
                 }
             }
         }

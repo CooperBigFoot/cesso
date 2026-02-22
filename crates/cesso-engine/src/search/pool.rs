@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cesso_core::{Board, Move, generate_legal_moves};
+use cesso_core::{Board, Color, Move, generate_legal_moves};
 
 use crate::search::control::SearchControl;
 use crate::search::heuristics::{HistoryTable, KillerTable};
@@ -52,6 +52,8 @@ impl ThreadPool {
         max_depth: u8,
         control: &SearchControl,
         history: &[u64],
+        contempt: i32,
+        engine_color: Color,
         mut on_iter: F,
     ) -> SearchResult
     where
@@ -81,7 +83,7 @@ impl ThreadPool {
 
         if self.num_threads <= 1 {
             // Single-thread fast path — no scope overhead
-            return self.search_single(board, max_depth, control, history, on_iter);
+            return self.search_single(board, max_depth, control, history, contempt, engine_color, on_iter);
         }
 
         // Shared node counters — one AtomicU64 per thread to avoid contention
@@ -103,12 +105,12 @@ impl ThreadPool {
             for (thread_id, node_counter) in node_counters.iter().enumerate().skip(1) {
                 let tt = &self.tt;
                 s.spawn(move || {
-                    run_helper(thread_id, tt, board, max_depth, control, node_counter, history);
+                    run_helper(thread_id, tt, board, max_depth, control, node_counter, history, contempt, engine_color);
                 });
             }
 
             // Thread 0 runs on this thread (the coordinator)
-            result = self.search_main(board, max_depth, control, history, &mut on_iter, &node_counters[0]);
+            result = self.search_main(board, max_depth, control, history, contempt, engine_color, &mut on_iter, &node_counters[0]);
         });
         // scope auto-joins all helpers here
 
@@ -129,6 +131,8 @@ impl ThreadPool {
         max_depth: u8,
         control: &SearchControl,
         history: &[u64],
+        contempt: i32,
+        engine_color: Color,
         mut on_iter: F,
     ) -> SearchResult
     where
@@ -142,6 +146,8 @@ impl ThreadPool {
             killers: KillerTable::new(),
             history_table: HistoryTable::new(),
             history: history.to_vec(),
+            contempt,
+            engine_color,
         };
 
         let mut completed_move = Move::NULL;
@@ -205,6 +211,8 @@ impl ThreadPool {
         max_depth: u8,
         control: &SearchControl,
         history: &[u64],
+        contempt: i32,
+        engine_color: Color,
         on_iter: &mut F,
         node_counter: &AtomicU64,
     ) -> SearchResult
@@ -219,6 +227,8 @@ impl ThreadPool {
             killers: KillerTable::new(),
             history_table: HistoryTable::new(),
             history: history.to_vec(),
+            contempt,
+            engine_color,
         };
 
         let mut completed_move = Move::NULL;
@@ -287,6 +297,8 @@ fn run_helper(
     control: &SearchControl,
     node_counter: &AtomicU64,
     history: &[u64],
+    contempt: i32,
+    engine_color: Color,
 ) {
     let mut ctx = SearchContext {
         nodes: 0,
@@ -296,6 +308,8 @@ fn run_helper(
         killers: KillerTable::new(),
         history_table: HistoryTable::new(),
         history: history.to_vec(),
+        contempt,
+        engine_color,
     };
 
     // Depth offset: helpers start at different depths to increase search divergence.
