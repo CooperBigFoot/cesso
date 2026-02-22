@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-I am building my first chess engine in pure rust. The engine is called cesso (toilet in italian but it also sounds like chess)
+A pure Rust UCI chess engine featuring bitboard move generation, PVS search with LMR/futility pruning, dual evaluation (hand-crafted + NNUE), Lazy SMP, and dynamic time management. The engine is called cesso (toilet in Italian, but it also sounds like chess).
 
 ## Version Bumping (mandatory)
 
