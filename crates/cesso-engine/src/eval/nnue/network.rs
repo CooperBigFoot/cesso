@@ -40,7 +40,7 @@ pub struct Network {
 // The binary was written with the same layout by Bullet's quantized export.
 // size_of::<Network>() == 1_607_744 (includes tail padding for align(64)).
 static NNUE: Network = unsafe {
-    std::mem::transmute(*include_bytes!("../../../../../nets/cesso-nnue-40.bin"))
+    std::mem::transmute(*include_bytes!("../../../../../nets/cesso-nnue-320.bin"))
 };
 
 impl Network {
