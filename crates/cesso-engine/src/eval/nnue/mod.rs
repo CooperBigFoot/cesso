@@ -1,4 +1,4 @@
-//! NNUE evaluation using a (768->128)x2->1 SCReLU network.
+//! NNUE evaluation using a (768->1024)x2->1x8 SCReLU network.
 
 mod accumulator;
 mod features;
@@ -8,6 +8,17 @@ use cesso_core::{Board, Color};
 
 use self::accumulator::Accumulator;
 use self::network::Network;
+use self::network::NUM_BUCKETS;
+
+/// Compute the output bucket index from material count.
+///
+/// Must match Bullet's `MaterialCount<8>`:
+/// `bucket = (occupied_count - 2) / (32.div_ceil(8))` = `(occ - 2) / 4`.
+#[inline]
+fn output_bucket(board: &Board) -> usize {
+    let piece_count = board.occupied().count() as usize;
+    (piece_count.saturating_sub(2)) / 4
+}
 
 /// Evaluate the board using NNUE.
 ///
@@ -15,6 +26,7 @@ use self::network::Network;
 /// (positive = good for the side to move).
 pub fn evaluate(board: &Board) -> i32 {
     let net = Network::get();
+    let bucket = output_bucket(board);
 
     let white_acc = Accumulator::refresh(board, Color::White, net);
     let black_acc = Accumulator::refresh(board, Color::Black, net);
@@ -24,7 +36,7 @@ pub fn evaluate(board: &Board) -> i32 {
         Color::Black => (&black_acc, &white_acc),
     };
 
-    net.evaluate(us, them)
+    net.evaluate(us, them, bucket)
 }
 
 #[cfg(test)]
@@ -34,14 +46,15 @@ mod tests {
     use super::evaluate;
     use super::features::feature_index;
     use super::network::Network;
+    use super::NUM_BUCKETS;
 
     /// Network struct size must match the binary file exactly.
     #[test]
     fn network_size_matches_binary() {
         assert_eq!(
             std::mem::size_of::<Network>(),
-            197_440,
-            "Network struct size must match cesso-nnue-40.bin"
+            1_607_744,
+            "Network struct size must match new bucketed binary"
         );
     }
 
