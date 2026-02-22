@@ -11,6 +11,20 @@ use crate::piece_kind::PieceKind;
 use crate::square::Square;
 use crate::zobrist;
 
+/// Toggle the appropriate partial hash fields when a piece is added or removed.
+fn toggle_partial_hashes(b: &mut Board, kind: PieceKind, color: Color, sq: Square) {
+    let key = zobrist::PIECE_SQUARE[Piece::new(kind, color).index()][sq.index()];
+    match kind {
+        PieceKind::Pawn => b.xor_pawn_hash(key),
+        PieceKind::Knight | PieceKind::Bishop => b.xor_minor_hash(key),
+        PieceKind::Rook | PieceKind::Queen => b.xor_major_hash(key),
+        PieceKind::King => {}
+    }
+    if kind != PieceKind::Pawn && kind != PieceKind::King {
+        b.xor_non_pawn_hash(color, key);
+    }
+}
+
 /// Maps each square index to the castling rights that must be removed when
 /// that square is the source or destination of any move.
 const CASTLE_RIGHTS_REVOKE: [CastleRights; 64] = {
@@ -123,6 +137,7 @@ impl Board {
                 if is_capture && let Some(captured_kind) = b.piece_on(dst) {
                     b.toggle_piece(dst, captured_kind, them);
                     b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(captured_kind, them).index()][dst.index()]);
+                    toggle_partial_hashes(&mut b, captured_kind, them, dst);
                 }
 
                 // Move our piece: XOR it off src and onto dst.
@@ -131,6 +146,8 @@ impl Board {
                 let piece_idx = Piece::new(moving_piece, us).index();
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[piece_idx][src.index()]);
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[piece_idx][dst.index()]);
+                toggle_partial_hashes(&mut b, moving_piece, us, src);
+                toggle_partial_hashes(&mut b, moving_piece, us, dst);
 
                 // Record en passant target square after a double pawn push.
                 if moving_piece == PieceKind::Pawn {
@@ -151,16 +168,19 @@ impl Board {
                 if is_capture && let Some(captured_kind) = b.piece_on(dst) {
                     b.toggle_piece(dst, captured_kind, them);
                     b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(captured_kind, them).index()][dst.index()]);
+                    toggle_partial_hashes(&mut b, captured_kind, them, dst);
                 }
 
                 // Remove the promoting pawn from src.
                 b.toggle_piece(src, PieceKind::Pawn, us);
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(PieceKind::Pawn, us).index()][src.index()]);
+                toggle_partial_hashes(&mut b, PieceKind::Pawn, us, src);
 
                 // Place the promoted piece on dst.
                 let promo_kind = mv.promotion_piece().to_piece_kind();
                 b.toggle_piece(dst, promo_kind, us);
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(promo_kind, us).index()][dst.index()]);
+                toggle_partial_hashes(&mut b, promo_kind, us, dst);
             }
 
             MoveKind::EnPassant => {
@@ -170,6 +190,8 @@ impl Board {
                 let pawn_idx = Piece::new(PieceKind::Pawn, us).index();
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[pawn_idx][src.index()]);
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[pawn_idx][dst.index()]);
+                toggle_partial_hashes(&mut b, PieceKind::Pawn, us, src);
+                toggle_partial_hashes(&mut b, PieceKind::Pawn, us, dst);
 
                 // Remove the captured pawn, which stands on the same rank as
                 // `src` and the same file as `dst` — one rank behind `dst`.
@@ -181,6 +203,7 @@ impl Board {
                 if let Some(captured_sq) = Square::from_index(captured_idx as u8) {
                     b.toggle_piece(captured_sq, PieceKind::Pawn, them);
                     b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[Piece::new(PieceKind::Pawn, them).index()][captured_sq.index()]);
+                    toggle_partial_hashes(&mut b, PieceKind::Pawn, them, captured_sq);
                 }
             }
 
@@ -191,6 +214,8 @@ impl Board {
                 let king_idx = Piece::new(PieceKind::King, us).index();
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[king_idx][src.index()]);
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[king_idx][dst.index()]);
+                toggle_partial_hashes(&mut b, PieceKind::King, us, src);
+                toggle_partial_hashes(&mut b, PieceKind::King, us, dst);
 
                 // Move the rook to its post-castling square.
                 let (rook_src, rook_dst) = match dst.index() {
@@ -205,6 +230,8 @@ impl Board {
                 let rook_idx = Piece::new(PieceKind::Rook, us).index();
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[rook_idx][rook_src.index()]);
                 b.set_hash(b.hash() ^ zobrist::PIECE_SQUARE[rook_idx][rook_dst.index()]);
+                toggle_partial_hashes(&mut b, PieceKind::Rook, us, rook_src);
+                toggle_partial_hashes(&mut b, PieceKind::Rook, us, rook_dst);
             }
         }
 
@@ -631,5 +658,118 @@ mod tests {
         assert_eq!(board.halfmove_clock(), 0);
         let null = board.make_null_move();
         assert_eq!(null.halfmove_clock(), 1);
+    }
+
+    // --- Partial Zobrist hash tests ---
+
+    #[test]
+    fn partial_hashes_match_scratch_after_normal_move() {
+        let board = starting();
+        let after = board.make_move(Move::new(Square::E2, Square::E4));
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&after);
+        assert_eq!(after.pawn_hash(), ph);
+        assert_eq!(after.non_pawn_hash(Color::White), nph[0]);
+        assert_eq!(after.non_pawn_hash(Color::Black), nph[1]);
+        assert_eq!(after.major_hash(), majh);
+        assert_eq!(after.minor_hash(), minh);
+    }
+
+    #[test]
+    fn partial_hashes_match_scratch_after_capture() {
+        let b = starting()
+            .make_move(Move::new(Square::E2, Square::E4))
+            .make_move(Move::new(Square::D7, Square::D5));
+        let after = b.make_move(Move::new(Square::E4, Square::D5));
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&after);
+        assert_eq!(after.pawn_hash(), ph);
+        assert_eq!(after.non_pawn_hash(Color::White), nph[0]);
+        assert_eq!(after.non_pawn_hash(Color::Black), nph[1]);
+        assert_eq!(after.major_hash(), majh);
+        assert_eq!(after.minor_hash(), minh);
+    }
+
+    #[test]
+    fn partial_hashes_match_scratch_after_en_passant() {
+        let b = starting()
+            .make_move(Move::new(Square::E2, Square::E4))
+            .make_move(Move::new(Square::A7, Square::A6))
+            .make_move(Move::new(Square::E4, Square::E5))
+            .make_move(Move::new(Square::D7, Square::D5));
+        let after = b.make_move(Move::new_en_passant(Square::E5, Square::D6));
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&after);
+        assert_eq!(after.pawn_hash(), ph);
+        assert_eq!(after.non_pawn_hash(Color::White), nph[0]);
+        assert_eq!(after.non_pawn_hash(Color::Black), nph[1]);
+        assert_eq!(after.major_hash(), majh);
+        assert_eq!(after.minor_hash(), minh);
+    }
+
+    #[test]
+    fn partial_hashes_match_scratch_after_castling() {
+        let board: Board = "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1".parse().unwrap();
+        let after = board.make_move(Move::new_castle(Square::E1, Square::G1));
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&after);
+        assert_eq!(after.pawn_hash(), ph);
+        assert_eq!(after.non_pawn_hash(Color::White), nph[0]);
+        assert_eq!(after.non_pawn_hash(Color::Black), nph[1]);
+        assert_eq!(after.major_hash(), majh);
+        assert_eq!(after.minor_hash(), minh);
+    }
+
+    #[test]
+    fn partial_hashes_match_scratch_after_promotion() {
+        let board: Board = "4k3/4P3/8/8/8/8/8/4K3 w - - 0 1".parse().unwrap();
+        let after = board.make_move(Move::new_promotion(Square::E7, Square::E8, PromotionPiece::Queen));
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&after);
+        assert_eq!(after.pawn_hash(), ph);
+        assert_eq!(after.non_pawn_hash(Color::White), nph[0]);
+        assert_eq!(after.non_pawn_hash(Color::Black), nph[1]);
+        assert_eq!(after.major_hash(), majh);
+        assert_eq!(after.minor_hash(), minh);
+    }
+
+    #[test]
+    fn partial_hashes_match_scratch_after_capture_promotion() {
+        let board: Board = "3rk3/4P3/8/8/8/8/8/4K3 w - - 0 1".parse().unwrap();
+        let after = board.make_move(Move::new_promotion(Square::E7, Square::D8, PromotionPiece::Queen));
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&after);
+        assert_eq!(after.pawn_hash(), ph);
+        assert_eq!(after.non_pawn_hash(Color::White), nph[0]);
+        assert_eq!(after.non_pawn_hash(Color::Black), nph[1]);
+        assert_eq!(after.major_hash(), majh);
+        assert_eq!(after.minor_hash(), minh);
+    }
+
+    #[test]
+    fn partial_hashes_match_scratch_many_moves() {
+        let moves = [
+            Move::new(Square::E2, Square::E4),
+            Move::new(Square::E7, Square::E5),
+            Move::new(Square::G1, Square::F3),
+            Move::new(Square::B8, Square::C6),
+            Move::new(Square::F1, Square::B5),
+            Move::new(Square::A7, Square::A6),
+        ];
+        let mut board = starting();
+        for mv in &moves {
+            board = board.make_move(*mv);
+            let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&board);
+            assert_eq!(board.pawn_hash(), ph, "pawn_hash mismatch after {mv}");
+            assert_eq!(board.non_pawn_hash(Color::White), nph[0], "non_pawn_hash[W] mismatch after {mv}");
+            assert_eq!(board.non_pawn_hash(Color::Black), nph[1], "non_pawn_hash[B] mismatch after {mv}");
+            assert_eq!(board.major_hash(), majh, "major_hash mismatch after {mv}");
+            assert_eq!(board.minor_hash(), minh, "minor_hash mismatch after {mv}");
+        }
+    }
+
+    #[test]
+    fn partial_hashes_null_move_preserves() {
+        let board = starting();
+        let null = board.make_null_move();
+        assert_eq!(board.pawn_hash(), null.pawn_hash());
+        assert_eq!(board.non_pawn_hash(Color::White), null.non_pawn_hash(Color::White));
+        assert_eq!(board.non_pawn_hash(Color::Black), null.non_pawn_hash(Color::Black));
+        assert_eq!(board.major_hash(), null.major_hash());
+        assert_eq!(board.minor_hash(), null.minor_hash());
     }
 }

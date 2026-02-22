@@ -135,12 +135,23 @@ impl FromStr for Board {
             en_passant,
             halfmove_clock,
             fullmove_number,
-            0, // placeholder hash
+            0,      // placeholder hash
+            0,      // placeholder pawn_hash
+            [0; 2], // placeholder non_pawn_hash
+            0,      // placeholder major_hash
+            0,      // placeholder minor_hash
         );
 
         // Compute and set the real Zobrist hash
         let hash = crate::zobrist::hash_from_scratch(&board);
         board.set_hash(hash);
+
+        // Compute and set the partial hashes
+        let (ph, nph, majh, minh) = crate::zobrist::partial_hashes_from_scratch(&board);
+        board.set_pawn_hash(ph);
+        board.set_non_pawn_hash(nph);
+        board.set_major_hash(majh);
+        board.set_minor_hash(minh);
 
         board.validate()?;
         Ok(board)

@@ -32,6 +32,14 @@ pub struct Board {
     fullmove_number: u16,
     /// Zobrist hash of the position.
     hash: u64,
+    /// Zobrist hash of all pawns (both colors).
+    pawn_hash: u64,
+    /// Per-color Zobrist hash of non-pawn, non-king pieces.
+    non_pawn_hash: [u64; 2],
+    /// Zobrist hash of rooks and queens (both colors).
+    major_hash: u64,
+    /// Zobrist hash of knights and bishops (both colors).
+    minor_hash: u64,
 }
 
 impl Board {
@@ -86,8 +94,17 @@ impl Board {
             halfmove_clock: 0,
             fullmove_number: 1,
             hash: 0,
+            pawn_hash: 0,
+            non_pawn_hash: [0; 2],
+            major_hash: 0,
+            minor_hash: 0,
         };
         board.hash = zobrist::hash_from_scratch(&board);
+        let (ph, nph, majh, minh) = zobrist::partial_hashes_from_scratch(&board);
+        board.set_pawn_hash(ph);
+        board.set_non_pawn_hash(nph);
+        board.set_major_hash(majh);
+        board.set_minor_hash(minh);
         board
     }
 
@@ -103,6 +120,10 @@ impl Board {
         halfmove_clock: u16,
         fullmove_number: u16,
         hash: u64,
+        pawn_hash: u64,
+        non_pawn_hash: [u64; 2],
+        major_hash: u64,
+        minor_hash: u64,
     ) -> Board {
         Board {
             pieces,
@@ -114,6 +135,10 @@ impl Board {
             halfmove_clock,
             fullmove_number,
             hash,
+            pawn_hash,
+            non_pawn_hash,
+            major_hash,
+            minor_hash,
         }
     }
 
@@ -208,6 +233,46 @@ impl Board {
     pub(crate) fn set_hash(&mut self, hash: u64) {
         self.hash = hash;
     }
+
+    /// Return the Zobrist hash of all pawns (both colors).
+    #[inline]
+    pub fn pawn_hash(&self) -> u64 { self.pawn_hash }
+
+    /// Return the per-color Zobrist hash of non-pawn, non-king pieces.
+    #[inline]
+    pub fn non_pawn_hash(&self, color: Color) -> u64 { self.non_pawn_hash[color.index()] }
+
+    /// Return the Zobrist hash of rooks and queens (both colors).
+    #[inline]
+    pub fn major_hash(&self) -> u64 { self.major_hash }
+
+    /// Return the Zobrist hash of knights and bishops (both colors).
+    #[inline]
+    pub fn minor_hash(&self) -> u64 { self.minor_hash }
+
+    #[inline]
+    pub(crate) fn set_pawn_hash(&mut self, h: u64) { self.pawn_hash = h; }
+
+    #[inline]
+    pub(crate) fn set_non_pawn_hash(&mut self, h: [u64; 2]) { self.non_pawn_hash = h; }
+
+    #[inline]
+    pub(crate) fn set_major_hash(&mut self, h: u64) { self.major_hash = h; }
+
+    #[inline]
+    pub(crate) fn set_minor_hash(&mut self, h: u64) { self.minor_hash = h; }
+
+    #[inline]
+    pub(crate) fn xor_pawn_hash(&mut self, key: u64) { self.pawn_hash ^= key; }
+
+    #[inline]
+    pub(crate) fn xor_non_pawn_hash(&mut self, color: Color, key: u64) { self.non_pawn_hash[color.index()] ^= key; }
+
+    #[inline]
+    pub(crate) fn xor_major_hash(&mut self, key: u64) { self.major_hash ^= key; }
+
+    #[inline]
+    pub(crate) fn xor_minor_hash(&mut self, key: u64) { self.minor_hash ^= key; }
 
     /// Toggle a piece into/out of the board arrays via XOR.
     #[inline]

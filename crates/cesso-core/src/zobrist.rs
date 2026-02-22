@@ -3,6 +3,7 @@
 use crate::board::Board;
 use crate::color::Color;
 use crate::piece::Piece;
+use crate::piece_kind::PieceKind;
 
 /// Zobrist key for each (piece, square) pair. Indexed by `[Piece::index()][Square::index()]`.
 /// Piece::index() returns 0-11: White P,N,B,R,Q,K then Black P,N,B,R,Q,K.
@@ -88,6 +89,35 @@ const fn xorshift64(mut state: u64) -> (u64, u64) {
     state ^= state >> 7;
     state ^= state << 17;
     (state, state)
+}
+
+/// Compute all four partial Zobrist hashes from scratch.
+pub(crate) fn partial_hashes_from_scratch(board: &Board) -> (u64, [u64; 2], u64, u64) {
+    let mut pawn_hash = 0u64;
+    let mut non_pawn_hash = [0u64; 2];
+    let mut major_hash = 0u64;
+    let mut minor_hash = 0u64;
+
+    for piece in Piece::ALL {
+        let kind = piece.kind();
+        let color = piece.color();
+        let mut bb = board.pieces(kind) & board.side(color);
+        while let Some((sq, rest)) = bb.pop_lsb() {
+            let key = PIECE_SQUARE[piece.index()][sq.index()];
+            match kind {
+                PieceKind::Pawn => pawn_hash ^= key,
+                PieceKind::Knight | PieceKind::Bishop => minor_hash ^= key,
+                PieceKind::Rook | PieceKind::Queen => major_hash ^= key,
+                PieceKind::King => {}
+            }
+            if kind != PieceKind::Pawn && kind != PieceKind::King {
+                non_pawn_hash[color.index()] ^= key;
+            }
+            bb = rest;
+        }
+    }
+
+    (pawn_hash, non_pawn_hash, major_hash, minor_hash)
 }
 
 /// Compute a Zobrist hash from scratch for the given board.
