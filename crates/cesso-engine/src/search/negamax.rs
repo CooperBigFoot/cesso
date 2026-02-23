@@ -1,11 +1,14 @@
-//! Negamax alpha-beta search with quiescence.
+//! Negamax alpha-beta search with quiescence, PVS, LMR, and advanced pruning.
 
-use cesso_core::{Board, Color, Move, MoveKind, generate_legal_moves};
+use cesso_core::{Board, Color, Move, MoveKind, PieceKind, generate_legal_moves};
 
 use crate::evaluate;
 use crate::search::control::SearchControl;
-use crate::search::heuristics::{HistoryTable, KillerTable};
-use crate::search::ordering::MovePicker;
+use crate::search::heuristics::{
+    ContHistIndex, ContinuationHistory, CorrectionHistory, HistoryTable, KillerTable,
+    StackEntry, update_cont_history,
+};
+use crate::search::ordering::{MovePicker, lmr_reduction};
 use crate::search::see::see_ge;
 use crate::search::tt::{Bound, TranspositionTable};
 
@@ -36,21 +39,64 @@ const LMP_MAX_DEPTH: u8 = 4;
 /// Move count threshold for LMP by depth (formula: 3 + d*d).
 const LMP_THRESHOLD: [usize; 5] = [0, 4, 7, 12, 19];
 
-/// Negamax alpha-beta search.
+/// ProbCut threshold margin above beta.
+const PROBCUT_MARGIN: i32 = 344;
+
+/// Razoring margins indexed by depth (depth <= 3).
+const RAZOR_MARGIN: [i32; 4] = [0, 300, 550, 900];
+
+/// History pruning threshold: prune if hist < -(HISTORY_PRUNE_MARGIN * depth).
+const HISTORY_PRUNE_MARGIN: i32 = 2711;
+
+/// Minimum depth for singular extension.
+const SE_DEPTH: u8 = 8;
+
+/// Double extension threshold (singular_score < singular_beta - SE_DOUBLE_MARGIN).
+const SE_DOUBLE_MARGIN: i32 = 23;
+
+/// Depth threshold above which NMP verification is required.
+const NMP_VERIFY_DEPTH: u8 = 12;
+
+/// Parameters passed to each negamax call beyond alpha/beta.
+#[derive(Clone, Copy)]
+pub(super) struct NodeParams {
+    pub depth: u8,
+    pub ply: u8,
+    pub do_null: bool,
+    pub excluded: Move,
+    pub cutnode: bool,
+}
+
+/// Check if the side to move has any non-pawn, non-king material.
+fn has_non_pawn_material(board: &Board) -> bool {
+    let us = board.side_to_move();
+    let our_pieces = board.side(us);
+    (board.pieces(PieceKind::Knight) & our_pieces).is_nonempty()
+        || (board.pieces(PieceKind::Bishop) & our_pieces).is_nonempty()
+        || (board.pieces(PieceKind::Rook) & our_pieces).is_nonempty()
+        || (board.pieces(PieceKind::Queen) & our_pieces).is_nonempty()
+}
+
+/// Negamax alpha-beta search with PVS, LMR, and all advanced pruning techniques.
 ///
 /// Returns the best score for the side to move. The principal
 /// variation is collected into `ctx.pv`.
 pub(super) fn negamax(
     board: &Board,
-    depth: u8,
-    ply: u8,
     mut alpha: i32,
     beta: i32,
-    do_null: bool,
+    params: NodeParams,
     ctx: &mut SearchContext<'_>,
 ) -> i32 {
+    let NodeParams { mut depth, ply, do_null, excluded, cutnode } = params;
+    let is_pv = alpha + 1 < beta;
+    let is_root = ply == 0;
+
     ctx.pv.clear_ply(ply as usize);
     ctx.nodes += 1;
+
+    // Reset cutoff count for this node
+    ctx.stack[ply as usize].cutoff_count = 0;
 
     // Check stop condition (time limit, node limit, etc.)
     if ctx.control.should_stop(ctx.nodes) {
@@ -75,68 +121,241 @@ pub(super) fn negamax(
         }
     }
 
-    // Probe transposition table
+    // Mate Distance Pruning
+    if !is_root {
+        alpha = alpha.max(-MATE_SCORE + ply as i32);
+        let new_beta = beta.min(MATE_SCORE - ply as i32 - 1);
+        if alpha >= new_beta {
+            return alpha;
+        }
+    }
+
+    // TT probe — skip if we have an excluded move (singular extension search)
     let mut tt_move = Move::NULL;
+    let mut tt_score = 0i32;
+    let mut tt_depth: u8 = 0;
+    let mut tt_bound = Bound::None;
+    let mut tt_is_pv = is_pv;
     let mut tt_eval: i32 = 0;
-    if let Some(tt_entry) = ctx.tt.probe(board.hash(), ply) {
-        tt_move = tt_entry.best_move;
-        tt_eval = tt_entry.eval;
-        // Cutoff if the stored depth is sufficient
-        if tt_entry.depth >= depth {
-            let cutoff = match tt_entry.bound {
-                Bound::Exact => true,
-                Bound::LowerBound => tt_entry.score >= beta,
-                Bound::UpperBound => tt_entry.score <= alpha,
-                Bound::None => false,
-            };
-            // Never cut off at the root — always search so the PV and
-            // score reflect the current iteration's work.  The TT move
-            // is still used for move ordering above.
-            if cutoff && ply > 0 {
-                return tt_entry.score;
+
+    if excluded.is_null() {
+        if let Some(tt_entry) = ctx.tt.probe(board.hash(), ply) {
+            tt_move = tt_entry.best_move;
+            tt_score = tt_entry.score;
+            tt_depth = tt_entry.depth;
+            tt_bound = tt_entry.bound;
+            tt_is_pv = tt_is_pv || tt_entry.is_pv;
+            tt_eval = tt_entry.eval;
+
+            // TT cutoff (not at root, not in PV)
+            if !is_root && tt_depth >= depth {
+                let cutoff = match tt_bound {
+                    Bound::Exact => true,
+                    Bound::LowerBound => tt_score >= beta,
+                    Bound::UpperBound => tt_score <= alpha,
+                    Bound::None => false,
+                };
+                if cutoff {
+                    return tt_score;
+                }
             }
         }
     }
 
-    // Compute check status once — used for extensions, NMP, and stalemate
+    // Compute check status
     let king_sq = board.king_square(board.side_to_move());
     let in_check = board.is_square_attacked(king_sq, !board.side_to_move());
 
-    // Check extension: extend search by one ply when in check
-    let depth = if in_check && (ply as usize) < MAX_PLY - 1 {
-        depth + 1
-    } else {
-        depth
-    };
+    // IIR — Internal Iterative Reduction
+    if (is_pv || cutnode) && depth > 4 && tt_move.is_null() {
+        depth = depth.saturating_sub(2);
+    }
 
-    // Leaf node — drop into quiescence search
+    // Check extension
+    if in_check && (ply as usize) < MAX_PLY - 1 {
+        depth += 1;
+    }
+
+    // Drop to qsearch at depth 0
     if depth == 0 {
         return qsearch(board, ply, alpha, beta, ctx);
     }
 
-    // --- Null Move Pruning ---
-    if do_null && ply > 0 && depth >= 3 && beta.abs() < MATE_THRESHOLD && !in_check {
-        let r = if depth >= 6 { 3 } else { 2 };
-        let null_board = board.make_null_move();
-        ctx.history.push(board.hash());
-        let null_score = -negamax(
-            &null_board,
-            depth.saturating_sub(1 + r),
-            ply + 1,
-            -beta,
-            -beta + 1,
-            false,
-            ctx,
-        );
-        ctx.history.pop();
-        if null_score >= beta {
-            return beta;
+    // Static eval with correction history
+    let raw_eval = if tt_eval != 0 { tt_eval } else { evaluate(board) };
+
+    // Get previous move info for correction history
+    let (prev_piece, prev_dest) = if ply >= 1 {
+        let prev = &ctx.stack[ply as usize - 1];
+        if !prev.current_move.is_null() {
+            (Some(prev.moved_piece), Some(prev.current_move.dest()))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+
+    let static_eval = if !in_check {
+        ctx.correction_history.correct_eval(
+            board.side_to_move(),
+            board.pawn_hash(),
+            board.non_pawn_hash(Color::White),
+            board.non_pawn_hash(Color::Black),
+            board.major_hash(),
+            board.minor_hash(),
+            prev_piece,
+            prev_dest,
+            raw_eval,
+        )
+    } else {
+        raw_eval
+    };
+
+    // Store static eval in stack
+    ctx.stack[ply as usize].static_eval = static_eval;
+
+    // Compute improving flag
+    let improving = if ply >= 2 && !in_check {
+        static_eval > ctx.stack[ply as usize - 2].static_eval
+    } else {
+        false
+    };
+
+    // Razoring
+    if !is_pv && !in_check && depth <= 3
+        && static_eval + RAZOR_MARGIN[depth as usize] < alpha
+    {
+        let razor_score = qsearch(board, ply, alpha, beta, ctx);
+        if razor_score <= alpha {
+            return razor_score;
         }
     }
 
+    // Reverse Futility Pruning
+    if !is_pv && !in_check && excluded.is_null()
+        && depth >= 1 && depth <= FUTILITY_DEPTH
+        && beta.abs() < MATE_THRESHOLD
+    {
+        let margin = RFP_MARGIN[depth as usize] - if improving { 0 } else { 100 };
+        if static_eval - margin >= beta {
+            return static_eval;
+        }
+    }
+
+    // Null Move Pruning
+    if do_null && !is_pv && ply > 0 && excluded.is_null()
+        && depth >= 3 && beta.abs() < MATE_THRESHOLD
+        && !in_check && has_non_pawn_material(board)
+        && static_eval >= beta
+    {
+        let r = if depth >= 6 { 3 } else { 2 };
+        let null_board = board.make_null_move();
+        ctx.history.push(board.hash());
+
+        // Clear stack entry for null move
+        ctx.stack[ply as usize].current_move = Move::NULL;
+        ctx.stack[ply as usize].cont_hist_index = None;
+
+        let null_score = -negamax(
+            &null_board,
+            -beta,
+            -beta + 1,
+            NodeParams {
+                depth: depth.saturating_sub(1 + r),
+                ply: ply + 1,
+                do_null: false,
+                excluded: Move::NULL,
+                cutnode: !cutnode,
+            },
+            ctx,
+        );
+        ctx.history.pop();
+
+        if null_score >= beta {
+            // NMP Verification at high depths
+            if depth > NMP_VERIFY_DEPTH {
+                let verify_score = negamax(
+                    board,
+                    alpha,
+                    beta,
+                    NodeParams {
+                        depth: depth.saturating_sub(1 + r),
+                        ply,
+                        do_null: false,
+                        excluded: Move::NULL,
+                        cutnode: false,
+                    },
+                    ctx,
+                );
+                if verify_score >= beta {
+                    return beta;
+                }
+                // Fall through to full search if verification fails
+            } else {
+                return beta;
+            }
+        }
+    }
+
+    // ProbCut
+    if !is_pv && !in_check && depth >= 7 && beta.abs() < MATE_THRESHOLD {
+        let probcut_beta = beta + PROBCUT_MARGIN;
+        let moves = generate_legal_moves(board);
+
+        for i in 0..moves.len() {
+            let mv = moves[i];
+            let is_tactical = board.piece_on(mv.dest()).is_some()
+                || mv.kind() == MoveKind::EnPassant
+                || mv.kind() == MoveKind::Promotion;
+            if !is_tactical || !see_ge(board, mv, probcut_beta - static_eval) {
+                continue;
+            }
+
+            let child = board.make_move(mv);
+            ctx.history.push(board.hash());
+
+            // qsearch to verify
+            let mut score = -qsearch(&child, ply + 1, -probcut_beta, -probcut_beta + 1, ctx);
+
+            if score >= probcut_beta {
+                // Verify with reduced negamax
+                score = -negamax(
+                    &child,
+                    -probcut_beta,
+                    -probcut_beta + 1,
+                    NodeParams {
+                        depth: depth.saturating_sub(5),
+                        ply: ply + 1,
+                        do_null: true,
+                        excluded: Move::NULL,
+                        cutnode: !cutnode,
+                    },
+                    ctx,
+                );
+            }
+
+            ctx.history.pop();
+
+            if score >= probcut_beta {
+                ctx.tt.store(
+                    board.hash(),
+                    depth.saturating_sub(3),
+                    score,
+                    raw_eval,
+                    mv,
+                    Bound::LowerBound,
+                    ply,
+                    false,
+                );
+                return score;
+            }
+        }
+    }
+
+    // Move generation
     let moves = generate_legal_moves(board);
 
-    // No legal moves: checkmate or stalemate
     if moves.is_empty() {
         return if in_check {
             -(MATE_SCORE - ply as i32)
@@ -145,101 +364,246 @@ pub(super) fn negamax(
         };
     }
 
-    // Static eval for pruning decisions — prefer TT eval if available
-    let static_eval = if tt_eval != 0 { tt_eval } else { evaluate(board) };
-
-    // --- Reverse Futility Pruning ---
-    // If our static eval is so far above beta that even subtracting a margin
-    // keeps it above, the opponent likely can't improve enough. Return early.
-    if !in_check && depth >= 1 && depth <= FUTILITY_DEPTH
-        && beta.abs() < MATE_THRESHOLD
-        && static_eval - RFP_MARGIN[depth as usize] >= beta
-    {
-        return static_eval;
-    }
-
     let original_alpha = alpha;
     let mut best_score = -INF;
     let mut best_move = Move::NULL;
-    let mut picker = MovePicker::new(&moves, board, tt_move, &ctx.killers, &ctx.history_table, ply as usize);
+    let mut picker = MovePicker::new(
+        &moves,
+        board,
+        tt_move,
+        &ctx.killers,
+        &ctx.history_table,
+        &ctx.cont_history,
+        &ctx.stack,
+        ply as usize,
+    );
     let mut searched_quiets = [Move::NULL; 64];
     let mut quiet_count: usize = 0;
     let mut move_count: usize = 0;
 
     while let Some(mv) = picker.pick_next() {
-        // Compute tactical status before make_move (only reads pre-move board)
+        // Skip excluded move (singular extension search)
+        if mv == excluded {
+            continue;
+        }
+
         let is_tactical = board.piece_on(mv.dest()).is_some()
             || mv.kind() == MoveKind::EnPassant
             || mv.kind() == MoveKind::Promotion;
 
-        // --- Forward Futility Pruning ---
-        // If the static eval + a margin cannot reach alpha, skip this move.
-        if !in_check && depth <= FUTILITY_DEPTH && !is_tactical
-            && move_count > 0 && alpha.abs() < MATE_THRESHOLD
-            && static_eval + FUTILITY_MARGIN[depth as usize] <= alpha
-        {
-            continue;
+        let moved_piece = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
+
+        // ── Pruning (skip non-first moves in some conditions) ──────────────
+
+        if move_count > 0 && !is_root {
+            // Forward Futility Pruning
+            if !in_check && depth <= FUTILITY_DEPTH && !is_tactical
+                && alpha.abs() < MATE_THRESHOLD
+            {
+                let margin = FUTILITY_MARGIN[depth as usize] - if improving { 0 } else { 50 };
+                if static_eval + margin <= alpha {
+                    continue;
+                }
+            }
+
+            // History pruning
+            if !in_check && !is_tactical && depth <= 5 {
+                let hist = ctx.history_table.score(moved_piece, mv.dest().index());
+                if hist < -(HISTORY_PRUNE_MARGIN * depth as i32) {
+                    continue;
+                }
+            }
+
+            // SEE pruning
+            if depth <= 5 && mv.kind() != MoveKind::Promotion {
+                if is_tactical {
+                    if !see_ge(board, mv, -(27 * depth as i32 * depth as i32)) {
+                        continue;
+                    }
+                } else if !in_check && !see_ge(board, mv, -(59 * depth as i32)) {
+                    continue;
+                }
+            }
+
+            // Late Move Pruning
+            let lmp_threshold = if improving {
+                LMP_THRESHOLD[depth.min(LMP_MAX_DEPTH) as usize]
+            } else {
+                LMP_THRESHOLD[depth.min(LMP_MAX_DEPTH) as usize] / 2
+            };
+            if !in_check && depth <= LMP_MAX_DEPTH && move_count >= lmp_threshold
+                && !is_tactical && best_score > -MATE_THRESHOLD
+            {
+                continue;
+            }
         }
 
-        // --- Late Move Pruning ---
-        // At shallow depths, skip late non-tactical moves once we've searched enough.
-        if !in_check
-            && depth <= LMP_MAX_DEPTH
-            && move_count >= LMP_THRESHOLD[depth as usize]
-            && !is_tactical
-            && best_score > -MATE_THRESHOLD
-        {
-            continue;
-        }
-
-        // Track quiet moves for history penalty on cutoff (after pruning)
+        // Track quiet moves searched before cutoff (for history penalty)
         let is_quiet_move = mv.kind() == MoveKind::Normal && board.piece_on(mv.dest()).is_none();
         if is_quiet_move && quiet_count < 64 {
             searched_quiets[quiet_count] = mv;
             quiet_count += 1;
         }
 
+        // Set stack entry before make_move
+        ctx.stack[ply as usize].current_move = mv;
+        ctx.stack[ply as usize].moved_piece = moved_piece;
+        ctx.stack[ply as usize].cont_hist_index = Some(ContHistIndex {
+            side: board.side_to_move(),
+            piece: moved_piece,
+            to: mv.dest(),
+        });
+
         let child = board.make_move(mv);
         move_count += 1;
-
-        // Push current position hash so the child can detect repetitions
-        // with ancestor positions (must NOT push child.hash() — the child
-        // would immediately match itself).
         ctx.history.push(board.hash());
 
-        // --- PVS + LMR ---
-        let mut score;
-        if move_count == 1 {
-            // PV move: full window, full depth
-            score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
-        } else if depth >= 3 && move_count >= 4 && !is_tactical && !in_check {
-            // LMR + PVS: three-step cascade
-            let r: u8 = if move_count >= 7 { 2 } else { 1 };
-            let reduced_depth = depth.saturating_sub(1 + r);
+        // ── Extensions ──────────────────────────────────────────────────────
+        let mut extension: i32 = 0;
 
-            // Step 1: reduced depth + null window
-            score = -negamax(&child, reduced_depth, ply + 1, -alpha - 1, -alpha, true, ctx);
+        // Singular Extension — for TT move only
+        if mv == tt_move && !is_root && depth >= SE_DEPTH
+            && tt_depth >= depth.saturating_sub(3) && tt_bound != Bound::UpperBound
+            && excluded.is_null()
+        {
+            let singular_beta = tt_score - 2 * depth as i32;
+            let singular_score = negamax(
+                board,
+                singular_beta - 1,
+                singular_beta,
+                NodeParams {
+                    depth: (depth - 1) / 2,
+                    ply,
+                    do_null: false,
+                    excluded: mv,
+                    cutnode,
+                },
+                ctx,
+            );
 
-            // Step 2: full depth + null window (verify LMR fail-high)
-            if score > alpha {
-                score = -negamax(&child, depth - 1, ply + 1, -alpha - 1, -alpha, true, ctx);
-            }
-
-            // Step 3: full depth + full window (get exact score)
-            if score > alpha {
-                score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
-            }
-        } else {
-            // Non-PV, non-LMR: null window
-            score = -negamax(&child, depth - 1, ply + 1, -alpha - 1, -alpha, true, ctx);
-
-            // Re-search with full window if null window failed high
-            if score > alpha {
-                score = -negamax(&child, depth - 1, ply + 1, -beta, -alpha, true, ctx);
+            if singular_score < singular_beta {
+                extension = 1;
+                // Double extension
+                if singular_score < singular_beta - SE_DOUBLE_MARGIN {
+                    extension = 2;
+                }
+            } else if singular_score >= beta {
+                // Multicut: not singular, another move also beats beta
+                ctx.history.pop();
+                return singular_score;
+            } else if tt_score >= beta {
+                // TT score beats beta but isn't singular — negative extension
+                extension = -3;
+            } else if cutnode {
+                extension = -2;
             }
         }
 
-        // Pop child position hash after recursion
+        let new_depth = ((depth as i32 - 1) + extension).max(0) as u8;
+
+        // ── PVS + LMR ───────────────────────────────────────────────────────
+        let score;
+        if move_count == 1 {
+            // First move: full window, full depth
+            score = -negamax(
+                &child,
+                -beta,
+                -alpha,
+                NodeParams {
+                    depth: new_depth,
+                    ply: ply + 1,
+                    do_null: true,
+                    excluded: Move::NULL,
+                    cutnode: false,
+                },
+                ctx,
+            );
+        } else {
+            let do_lmr = depth >= 3 && move_count >= 4 && !is_tactical && !in_check;
+
+            let mut searched_depth = new_depth;
+
+            if do_lmr {
+                // Base LMR reduction (in 1024ths of a ply)
+                let mut r = lmr_reduction(move_count, depth as usize);
+
+                // Adjustments (in 1024ths)
+                r -= 372; // Base offset
+                if is_pv { r -= 1062; }
+                if cutnode { r += 1303; }
+                if tt_is_pv { r -= 975; }
+                let is_killer = ctx.killers.is_killer(ply as usize, mv);
+                if is_killer { r -= 932; }
+
+                // History-based reduction for quiets
+                if is_quiet_move {
+                    let hist = ctx.history_table.score(moved_piece, mv.dest().index());
+                    // hist ranges -16384..16384, divide by 8 to get adjustment in 1024ths
+                    r -= hist / 8;
+                }
+
+                // Convert from 1024ths to plies, clamped to at least 1
+                let r_plies = (r / 1024).max(0) as u8;
+                searched_depth = new_depth.saturating_sub(r_plies).max(1);
+            }
+
+            // Null-window search at (possibly reduced) depth
+            let mut sc = -negamax(
+                &child,
+                -alpha - 1,
+                -alpha,
+                NodeParams {
+                    depth: searched_depth,
+                    ply: ply + 1,
+                    do_null: true,
+                    excluded: Move::NULL,
+                    cutnode: !cutnode,
+                },
+                ctx,
+            );
+
+            // Re-search at full depth if LMR reduced and score beats alpha
+            if do_lmr && sc > alpha && searched_depth < new_depth {
+                let re_depth = if sc > beta + 100 {
+                    new_depth + 1
+                } else {
+                    new_depth
+                };
+                sc = -negamax(
+                    &child,
+                    -alpha - 1,
+                    -alpha,
+                    NodeParams {
+                        depth: re_depth.min(127),
+                        ply: ply + 1,
+                        do_null: true,
+                        excluded: Move::NULL,
+                        cutnode: !cutnode,
+                    },
+                    ctx,
+                );
+            }
+
+            // Full window re-search for PV nodes
+            if sc > alpha && is_pv {
+                sc = -negamax(
+                    &child,
+                    -beta,
+                    -alpha,
+                    NodeParams {
+                        depth: new_depth,
+                        ply: ply + 1,
+                        do_null: true,
+                        excluded: Move::NULL,
+                        cutnode: false,
+                    },
+                    ctx,
+                );
+            }
+
+            score = sc;
+        }
+
         ctx.history.pop();
 
         if score > best_score {
@@ -252,18 +616,37 @@ pub(super) fn negamax(
         }
 
         if alpha >= beta {
-            // Update killer and history for quiet moves that cause cutoffs
-            let is_quiet = mv.kind() == MoveKind::Normal && board.piece_on(mv.dest()).is_none();
-            if is_quiet {
+            // Cutoff — update heuristics
+            ctx.stack[ply as usize].cutoff_count += 1;
+
+            if is_quiet_move {
                 ctx.killers.store(ply as usize, mv);
-                if let Some(piece) = board.piece_on(mv.source()) {
-                    ctx.history_table.update_good(piece, mv.dest().index(), depth);
-                    // Penalise all quiet moves searched before the cutoff move
-                    for i in 0..quiet_count {
-                        let bad_mv = searched_quiets[i];
-                        if let Some(bad_piece) = board.piece_on(bad_mv.source()) {
-                            ctx.history_table.update_bad(bad_piece, bad_mv.dest().index(), depth);
-                        }
+                let bonus = (depth as i32) * (depth as i32);
+
+                // Reward cutoff move
+                ctx.history_table.update(moved_piece, mv.dest().index(), bonus);
+                update_cont_history(
+                    &mut ctx.cont_history,
+                    &ctx.stack,
+                    ply as usize,
+                    moved_piece,
+                    mv.dest().index(),
+                    bonus,
+                );
+
+                // Penalise all previously searched quiets
+                for i in 0..quiet_count.saturating_sub(1) {
+                    let bad_mv = searched_quiets[i];
+                    if let Some(bad_piece) = board.piece_on(bad_mv.source()) {
+                        ctx.history_table.update(bad_piece, bad_mv.dest().index(), -bonus);
+                        update_cont_history(
+                            &mut ctx.cont_history,
+                            &ctx.stack,
+                            ply as usize,
+                            bad_piece,
+                            bad_mv.dest().index(),
+                            -bonus,
+                        );
                     }
                 }
             }
@@ -271,21 +654,50 @@ pub(super) fn negamax(
         }
     }
 
-    // Determine bound type and store in TT
-    let bound = if best_score <= original_alpha {
-        Bound::UpperBound
-    } else if best_score >= beta {
-        Bound::LowerBound
-    } else {
-        Bound::Exact
-    };
+    // TT store — skip during singular extension search
+    if excluded.is_null() {
+        let bound = if best_score <= original_alpha {
+            Bound::UpperBound
+        } else if best_score >= beta {
+            Bound::LowerBound
+        } else {
+            Bound::Exact
+        };
 
-    let store_move = if bound == Bound::UpperBound && best_move.is_null() {
-        tt_move // preserve ordering hint from prior entry
-    } else {
-        best_move
-    };
-    ctx.tt.store(board.hash(), depth, best_score, static_eval, store_move, bound, ply);
+        let store_move = if bound == Bound::UpperBound && best_move.is_null() {
+            tt_move
+        } else {
+            best_move
+        };
+        ctx.tt.store(
+            board.hash(),
+            depth,
+            best_score,
+            raw_eval,
+            store_move,
+            bound,
+            ply,
+            is_pv || tt_is_pv,
+        );
+
+        // Update correction history
+        if !in_check && !best_move.is_null()
+            && (bound == Bound::Exact || bound == Bound::LowerBound)
+        {
+            let score_diff = best_score - raw_eval;
+            ctx.correction_history.update(
+                board.side_to_move(),
+                board.pawn_hash(),
+                board.non_pawn_hash(Color::White),
+                board.non_pawn_hash(Color::Black),
+                board.major_hash(),
+                board.minor_hash(),
+                prev_piece,
+                prev_dest,
+                score_diff,
+            );
+        }
+    }
 
     best_score
 }
@@ -301,9 +713,17 @@ pub(super) fn aspiration_search(
     prev_score: i32,
     ctx: &mut SearchContext<'_>,
 ) -> i32 {
+    let base_params = NodeParams {
+        depth,
+        ply: 0,
+        do_null: true,
+        excluded: Move::NULL,
+        cutnode: false,
+    };
+
     // Full window for shallow depths or near-mate scores
     if depth <= 4 || prev_score.abs() >= MATE_THRESHOLD {
-        return negamax(board, depth, 0, -INF, INF, true, ctx);
+        return negamax(board, -INF, INF, base_params, ctx);
     }
 
     let mut delta: i32 = 50;
@@ -311,7 +731,7 @@ pub(super) fn aspiration_search(
     let mut beta = (prev_score + delta).min(INF);
 
     loop {
-        let score = negamax(board, depth, 0, alpha, beta, true, ctx);
+        let score = negamax(board, alpha, beta, base_params, ctx);
 
         // Abort immediately if the search was stopped
         if ctx.control.should_stop(ctx.nodes) {
@@ -495,8 +915,13 @@ pub(super) struct SearchContext<'a> {
     pub killers: KillerTable,
     /// History heuristic table.
     pub history_table: HistoryTable,
+    /// Continuation history table.
+    pub cont_history: Box<ContinuationHistory>,
+    /// Correction history for static eval adjustment.
+    pub correction_history: Box<CorrectionHistory>,
+    /// Per-ply search stack.
+    pub stack: [StackEntry; MAX_PLY],
     /// Zobrist hashes of positions visited during this search (for repetition detection).
-    /// Grows/shrinks with the search stack via push/pop.
     pub history: Vec<u64>,
     /// Contempt factor in centipawns — biases draw evaluation.
     pub contempt: i32,

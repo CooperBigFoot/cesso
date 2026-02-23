@@ -12,8 +12,8 @@ pub mod tt;
 use cesso_core::{Board, Color, Move, generate_legal_moves};
 
 use control::SearchControl;
-use heuristics::{HistoryTable, KillerTable};
-use negamax::{INF, PvTable, SearchContext, aspiration_search};
+use heuristics::{ContinuationHistory, CorrectionHistory, HistoryTable, KillerTable, StackEntry};
+use negamax::{INF, MAX_PLY, PvTable, SearchContext, aspiration_search};
 use tt::TranspositionTable;
 
 /// Result of a completed search.
@@ -177,6 +177,9 @@ impl Searcher {
             control,
             killers: KillerTable::new(),
             history_table: HistoryTable::new(),
+            cont_history: Box::new(ContinuationHistory::new()),
+            correction_history: Box::new(CorrectionHistory::new()),
+            stack: [StackEntry::EMPTY; MAX_PLY],
             history: history.to_vec(),
             contempt,
             engine_color,

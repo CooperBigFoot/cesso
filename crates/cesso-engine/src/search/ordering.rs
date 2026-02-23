@@ -1,9 +1,20 @@
-//! Move ordering via MVV-LVA (Most Valuable Victim - Least Valuable Attacker) and SEE.
+//! Move ordering via MVV-LVA, SEE, killers, history, and continuation history.
+//!
+//! Score bands ensure correct ordering:
+//! - TT move:              100,000
+//! - Queen promotion:       30,000
+//! - Good captures (SEE >= 0): 10,000 + MVV_LVA (10,007..10,144)
+//! - En passant:            10,015
+//! - Killer moves:           9,000
+//! - Quiet moves (history): bounded by ±HISTORY_MAX plus cont_hist
+//! - Bad captures (SEE < 0): -50,000 + see_score (always very negative)
+
+use std::sync::OnceLock;
 
 use cesso_core::{Board, Move, MoveKind, MoveList, PieceKind, PromotionPiece};
 
-use crate::search::heuristics::{HistoryTable, KillerTable};
-use crate::search::see::see;
+use crate::search::heuristics::{cont_hist_score, ContinuationHistory, HistoryTable, KillerTable, StackEntry};
+use crate::search::see::{see, see_ge};
 
 /// MVV-LVA scores indexed by `[victim][attacker]`.
 ///
@@ -24,51 +35,68 @@ const MVV_LVA: [[i32; 6]; 6] = [
     [-1, -3, -3, -5, -9, 0],
 ];
 
-/// Score a move for ordering purposes (main search with killer and history context).
-///
-/// Higher scores are searched first. Score bands:
-/// - TT move: 10,000 (assigned by MovePicker, not here)
-/// - Killer moves: 5,000
-/// - Good captures (SEE >= 0): 1,007..1,144
-/// - Queen promotion: 200
-/// - Rook promotion: 170
-/// - Bishop/Knight promotion: 160
-/// - Quiet (history-scored): -16384..16384
-/// - En passant: 15
-/// - Castling: 1
-/// - Bad captures (SEE < 0): -10,900..-10,001
-fn score_move_full(
+// ---------------------------------------------------------------------------
+// LMR reduction table
+// ---------------------------------------------------------------------------
+
+static LMR_TABLE: OnceLock<[[i32; 64]; 64]> = OnceLock::new();
+
+fn lmr_table() -> &'static [[i32; 64]; 64] {
+    LMR_TABLE.get_or_init(|| {
+        let mut t = [[0i32; 64]; 64];
+        for i in 1..64usize {
+            for d in 1..64usize {
+                t[i][d] =
+                    ((0.76 + (i as f64).ln() * (d as f64).ln() / 2.32) * 1024.0) as i32;
+            }
+        }
+        t
+    })
+}
+
+/// Get the LMR reduction for the given move index and depth (in 1024ths of a ply).
+pub fn lmr_reduction(move_index: usize, depth: usize) -> i32 {
+    lmr_table()[move_index.min(63)][depth.min(63)]
+}
+
+// ---------------------------------------------------------------------------
+// Internal scoring helpers
+// ---------------------------------------------------------------------------
+
+/// Score a move for the main search using staged score bands and continuation history.
+fn score_move_staged(
     board: &Board,
     mv: Move,
     killers: &KillerTable,
     history: &HistoryTable,
+    cont_history: &ContinuationHistory,
+    stack: &[StackEntry],
     ply: usize,
 ) -> i32 {
     match mv.kind() {
         MoveKind::Promotion => match mv.promotion_piece() {
-            PromotionPiece::Queen => 200,
+            PromotionPiece::Queen => 30_000,
             PromotionPiece::Rook => 170,
             PromotionPiece::Bishop | PromotionPiece::Knight => 160,
         },
-        MoveKind::EnPassant => 15,
+        MoveKind::EnPassant => 10_015,
         MoveKind::Castling => 1,
         MoveKind::Normal => {
             if let Some(victim) = board.piece_on(mv.dest()) {
                 let see_score = see(board, mv);
                 if see_score >= 0 {
-                    // Good capture: above quiets but below killers
                     let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
-                    1_000 + MVV_LVA[victim.index()][attacker.index()]
+                    10_000 + MVV_LVA[victim.index()][attacker.index()]
                 } else {
-                    // Bad capture: below all quiets
-                    -10_000 + see_score
+                    -50_000 + see_score
                 }
             } else if killers.is_killer(ply, mv) {
-                5_000
+                9_000
             } else {
-                // History score for quiet moves
                 let piece = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
-                history.score(piece, mv.dest().index())
+                let hist = history.score(piece, mv.dest().index());
+                let cont = cont_hist_score(cont_history, stack, ply, piece, mv.dest().index());
+                hist + cont / 2
             }
         }
     }
@@ -100,10 +128,16 @@ pub fn score_move(board: &Board, mv: Move) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MovePicker
+// ---------------------------------------------------------------------------
+
 /// Incremental move picker using selection sort.
 ///
-/// Yields moves in descending score order. For quiescence search,
-/// only yields moves with `score >= 1` (captures and promotions).
+/// Yields moves in descending score order. Score bands ensure TT move,
+/// good captures, killers, quiets, and bad captures are searched in the
+/// correct sequence. For quiescence search, only captures and promotions
+/// (score >= 1) are yielded.
 pub struct MovePicker {
     moves: [Move; 256],
     scores: [i32; 256],
@@ -113,17 +147,19 @@ pub struct MovePicker {
 }
 
 impl MovePicker {
-    /// Create a picker that yields all legal moves, ordered by score.
+    /// Create a staged picker that yields all legal moves ordered by priority.
     ///
-    /// If `tt_move` is not null and matches a move in the list, it receives
-    /// the highest priority score (10,000), ensuring it is searched first.
-    /// Killer and history context are used to score quiet moves.
+    /// Scoring uses staged bands:
+    /// TT move (100,000) > queen promotions (30,000) > good captures (10,007+) >
+    /// killers (9,000) > quiets (history-based) > bad captures (-50,000+).
     pub fn new(
         moves: &MoveList,
         board: &Board,
         tt_move: Move,
         killers: &KillerTable,
         history: &HistoryTable,
+        cont_history: &ContinuationHistory,
+        stack: &[StackEntry],
         ply: usize,
     ) -> Self {
         let mut picker = Self {
@@ -136,9 +172,9 @@ impl MovePicker {
         for i in 0..moves.len() {
             picker.moves[i] = moves[i];
             picker.scores[i] = if moves[i] == tt_move {
-                10_000
+                100_000
             } else {
-                score_move_full(board, moves[i], killers, history, ply)
+                score_move_staged(board, moves[i], killers, history, cont_history, stack, ply)
             };
         }
         picker
@@ -169,7 +205,6 @@ impl MovePicker {
             return None;
         }
 
-        // Find the index of the maximum score in cursor..len
         let mut best_idx = self.cursor;
         let mut best_score = self.scores[self.cursor];
         for i in (self.cursor + 1)..self.len {
@@ -179,12 +214,10 @@ impl MovePicker {
             }
         }
 
-        // Check minimum score threshold
         if best_score < self.min_score {
             return None;
         }
 
-        // Swap the best to cursor position
         self.moves.swap(self.cursor, best_idx);
         self.scores.swap(self.cursor, best_idx);
 
@@ -194,15 +227,98 @@ impl MovePicker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ProbCutPicker
+// ---------------------------------------------------------------------------
+
+/// Move picker for ProbCut — yields only captures and promotions with SEE >= threshold.
+///
+/// Ordered by MVV-LVA score. Quiet moves are excluded entirely.
+pub struct ProbCutPicker {
+    moves: [Move; 256],
+    scores: [i32; 256],
+    len: usize,
+    cursor: usize,
+}
+
+impl ProbCutPicker {
+    /// Create a ProbCut picker that yields captures/promotions with SEE >= `threshold`.
+    pub fn new(moves: &MoveList, board: &Board, threshold: i32) -> Self {
+        let mut picker = Self {
+            moves: [Move::NULL; 256],
+            scores: [0; 256],
+            len: 0,
+            cursor: 0,
+        };
+
+        for i in 0..moves.len() {
+            let mv = moves[i];
+
+            let is_tactical = board.piece_on(mv.dest()).is_some()
+                || mv.kind() == MoveKind::EnPassant
+                || mv.kind() == MoveKind::Promotion;
+
+            if !is_tactical {
+                continue;
+            }
+
+            if !see_ge(board, mv, threshold) {
+                continue;
+            }
+
+            let idx = picker.len;
+            picker.moves[idx] = mv;
+            picker.scores[idx] = if let Some(victim) = board.piece_on(mv.dest()) {
+                let attacker = board.piece_on(mv.source()).unwrap_or(PieceKind::Pawn);
+                MVV_LVA[victim.index()][attacker.index()]
+            } else if mv.kind() == MoveKind::Promotion {
+                200
+            } else {
+                // En passant: pawn captures pawn
+                15
+            };
+            picker.len += 1;
+        }
+
+        picker
+    }
+
+    /// Yield the next highest-scored move via selection sort.
+    pub fn pick_next(&mut self) -> Option<Move> {
+        if self.cursor >= self.len {
+            return None;
+        }
+
+        let mut best_idx = self.cursor;
+        let mut best_score = self.scores[self.cursor];
+        for i in (self.cursor + 1)..self.len {
+            if self.scores[i] > best_score {
+                best_score = self.scores[i];
+                best_idx = i;
+            }
+        }
+
+        self.moves.swap(self.cursor, best_idx);
+        self.scores.swap(self.cursor, best_idx);
+
+        let mv = self.moves[self.cursor];
+        self.cursor += 1;
+        Some(mv)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cesso_core::{generate_legal_moves, Board};
-    use crate::search::heuristics::{HistoryTable, KillerTable};
+    use crate::search::heuristics::{ContinuationHistory, HistoryTable, KillerTable, StackEntry};
 
     #[test]
     fn pawn_takes_queen_scores_higher_than_queen_takes_pawn() {
-        // PxQ should score 143, QxP should score 7
         assert!(MVV_LVA[PieceKind::Queen.index()][PieceKind::Pawn.index()]
             > MVV_LVA[PieceKind::Pawn.index()][PieceKind::Queen.index()]);
     }
@@ -237,7 +353,6 @@ mod tests {
             .parse()
             .unwrap();
         let moves = generate_legal_moves(&board);
-        // Find the en passant move
         let ep_move = moves.as_slice().iter().find(|m| m.kind() == MoveKind::EnPassant);
         assert!(ep_move.is_some(), "should have en passant move available");
         assert_eq!(score_move(&board, *ep_move.unwrap()), 15);
@@ -248,7 +363,6 @@ mod tests {
         let board = Board::starting_position();
         let moves = generate_legal_moves(&board);
         let mut picker = MovePicker::new_qsearch(&moves, &board);
-        // Starting position has no captures or promotions
         assert!(picker.pick_next().is_none());
     }
 
@@ -256,26 +370,88 @@ mod tests {
     fn picker_yields_all_moves_in_starting_position() {
         let board = Board::starting_position();
         let moves = generate_legal_moves(&board);
-        let mut picker = MovePicker::new(&moves, &board, Move::NULL, &KillerTable::new(), &HistoryTable::new(), 0);
+        let cont_hist = ContinuationHistory::new();
+        let stack = [StackEntry::EMPTY; 128];
+        let mut picker = MovePicker::new(
+            &moves,
+            &board,
+            Move::NULL,
+            &KillerTable::new(),
+            &HistoryTable::new(),
+            &cont_hist,
+            &stack,
+            0,
+        );
         let mut count = 0;
         while picker.pick_next().is_some() {
             count += 1;
         }
-        assert_eq!(count, 20); // 20 legal moves in starting position
+        assert_eq!(count, 20);
     }
 
     #[test]
     fn picker_yields_captures_before_quiet() {
-        // Position with both captures and quiet moves
-        // White queen on d4, black pawn on e5 — QxP is a capture
+        // White queen on d4, black pawn on e5 — QxP is a good capture
         let board: Board = "4k3/8/8/4p3/3Q4/8/8/4K3 w - - 0 1".parse().unwrap();
         let moves = generate_legal_moves(&board);
-        let mut picker = MovePicker::new(&moves, &board, Move::NULL, &KillerTable::new(), &HistoryTable::new(), 0);
+        let cont_hist = ContinuationHistory::new();
+        let stack = [StackEntry::EMPTY; 128];
+        let mut picker = MovePicker::new(
+            &moves,
+            &board,
+            Move::NULL,
+            &KillerTable::new(),
+            &HistoryTable::new(),
+            &cont_hist,
+            &stack,
+            0,
+        );
         let first = picker.pick_next().unwrap();
-        // First move should be the capture (highest scored)
         assert!(
             board.piece_on(first.dest()).is_some(),
             "first move from picker should be a capture"
         );
+    }
+
+    #[test]
+    fn tt_move_yielded_first() {
+        let board = Board::starting_position();
+        let moves = generate_legal_moves(&board);
+        let tt_move = moves[10];
+        let cont_hist = ContinuationHistory::new();
+        let stack = [StackEntry::EMPTY; 128];
+        let mut picker = MovePicker::new(
+            &moves,
+            &board,
+            tt_move,
+            &KillerTable::new(),
+            &HistoryTable::new(),
+            &cont_hist,
+            &stack,
+            0,
+        );
+        let first = picker.pick_next().unwrap();
+        assert_eq!(first, tt_move, "TT move should be yielded first");
+    }
+
+    #[test]
+    fn probcut_picker_filters_by_see() {
+        // White queen on d4, black pawn on e5 — QxP capture has positive SEE
+        let board: Board = "4k3/8/8/4p3/3Q4/8/8/4K3 w - - 0 1".parse().unwrap();
+        let moves = generate_legal_moves(&board);
+        let mut picker = ProbCutPicker::new(&moves, &board, 0);
+        let mut count = 0;
+        while picker.pick_next().is_some() {
+            count += 1;
+        }
+        assert!(count >= 1, "should have at least one good capture");
+    }
+
+    #[test]
+    fn lmr_reduction_increases_with_depth_and_move_count() {
+        let r_low = lmr_reduction(2, 3);
+        let r_high = lmr_reduction(10, 10);
+        assert!(r_high > r_low, "deeper searches with more moves should reduce more");
+        assert!(r_low > 0, "should have some reduction at depth 3, move 2");
     }
 }

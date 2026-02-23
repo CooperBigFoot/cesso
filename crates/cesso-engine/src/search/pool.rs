@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cesso_core::{Board, Color, Move, generate_legal_moves};
 
 use crate::search::control::SearchControl;
-use crate::search::heuristics::{HistoryTable, KillerTable};
-use crate::search::negamax::{INF, PvTable, SearchContext, aspiration_search};
+use crate::search::heuristics::{ContinuationHistory, CorrectionHistory, HistoryTable, KillerTable, StackEntry};
+use crate::search::negamax::{INF, MAX_PLY, PvTable, SearchContext, aspiration_search};
 use crate::search::tt::TranspositionTable;
 use crate::search::SearchResult;
 use crate::search::StabilityTracker;
@@ -145,6 +145,9 @@ impl ThreadPool {
             control,
             killers: KillerTable::new(),
             history_table: HistoryTable::new(),
+            cont_history: Box::new(ContinuationHistory::new()),
+            correction_history: Box::new(CorrectionHistory::new()),
+            stack: [StackEntry::EMPTY; MAX_PLY],
             history: history.to_vec(),
             contempt,
             engine_color,
@@ -226,6 +229,9 @@ impl ThreadPool {
             control,
             killers: KillerTable::new(),
             history_table: HistoryTable::new(),
+            cont_history: Box::new(ContinuationHistory::new()),
+            correction_history: Box::new(CorrectionHistory::new()),
+            stack: [StackEntry::EMPTY; MAX_PLY],
             history: history.to_vec(),
             contempt,
             engine_color,
@@ -307,6 +313,9 @@ fn run_helper(
         control,
         killers: KillerTable::new(),
         history_table: HistoryTable::new(),
+        cont_history: Box::new(ContinuationHistory::new()),
+        correction_history: Box::new(CorrectionHistory::new()),
+        stack: [StackEntry::EMPTY; MAX_PLY],
         history: history.to_vec(),
         contempt,
         engine_color,
