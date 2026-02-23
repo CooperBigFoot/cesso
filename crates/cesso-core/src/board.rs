@@ -209,6 +209,74 @@ impl Board {
         self.hash = hash;
     }
 
+    /// Compute a hash over the pawn structure (both sides).
+    ///
+    /// Uses the Zobrist piece-square keys for all pawns.
+    pub fn pawn_hash(&self) -> u64 {
+        use crate::piece::Piece;
+        let mut h = 0u64;
+        for color in Color::ALL {
+            let mut bb = self.pieces[PieceKind::Pawn.index()] & self.sides[color.index()];
+            let piece = Piece::new(PieceKind::Pawn, color);
+            while let Some((sq, rest)) = bb.pop_lsb() {
+                h ^= crate::zobrist::PIECE_SQUARE[piece.index()][sq.index()];
+                bb = rest;
+            }
+        }
+        h
+    }
+
+    /// Compute a hash over the non-pawn, non-king material for a given side.
+    ///
+    /// Useful for correction history conditioning on minor/major piece imbalances.
+    pub fn non_pawn_hash(&self, color: Color) -> u64 {
+        use crate::piece::Piece;
+        let mut h = 0u64;
+        for kind in [PieceKind::Knight, PieceKind::Bishop, PieceKind::Rook, PieceKind::Queen] {
+            let mut bb = self.pieces[kind.index()] & self.sides[color.index()];
+            let piece = Piece::new(kind, color);
+            while let Some((sq, rest)) = bb.pop_lsb() {
+                h ^= crate::zobrist::PIECE_SQUARE[piece.index()][sq.index()];
+                bb = rest;
+            }
+        }
+        h
+    }
+
+    /// Compute a hash over major pieces (rooks and queens) for both sides.
+    pub fn major_hash(&self) -> u64 {
+        use crate::piece::Piece;
+        let mut h = 0u64;
+        for color in Color::ALL {
+            for kind in [PieceKind::Rook, PieceKind::Queen] {
+                let mut bb = self.pieces[kind.index()] & self.sides[color.index()];
+                let piece = Piece::new(kind, color);
+                while let Some((sq, rest)) = bb.pop_lsb() {
+                    h ^= crate::zobrist::PIECE_SQUARE[piece.index()][sq.index()];
+                    bb = rest;
+                }
+            }
+        }
+        h
+    }
+
+    /// Compute a hash over minor pieces (knights and bishops) for both sides.
+    pub fn minor_hash(&self) -> u64 {
+        use crate::piece::Piece;
+        let mut h = 0u64;
+        for color in Color::ALL {
+            for kind in [PieceKind::Knight, PieceKind::Bishop] {
+                let mut bb = self.pieces[kind.index()] & self.sides[color.index()];
+                let piece = Piece::new(kind, color);
+                while let Some((sq, rest)) = bb.pop_lsb() {
+                    h ^= crate::zobrist::PIECE_SQUARE[piece.index()][sq.index()];
+                    bb = rest;
+                }
+            }
+        }
+        h
+    }
+
     /// Toggle a piece into/out of the board arrays via XOR.
     #[inline]
     #[allow(dead_code)]

@@ -7,7 +7,8 @@
 //! ```text
 //! word0 (AtomicU64):
 //!   bits 63-32: key           (upper 32 bits of Zobrist hash)
-//!   bits 31-26: generation    (6 bits, wraps at 64)
+//!   bits 31-27: generation    (5 bits, wraps at 32)
+//!   bits 26-26: is_pv         (1 bit)
 //!   bits 25-24: bound         (2 bits)
 //!   bits 23-16: depth         (8 bits)
 //!   bits 15-0:  move          (16 bits)
@@ -80,6 +81,8 @@ pub struct TtProbeResult {
     pub score: i32,
     /// Static evaluation.
     pub eval: i32,
+    /// Whether this entry was written from a PV node.
+    pub is_pv: bool,
 }
 
 /// Convert a search score to TT-storable form.
@@ -131,14 +134,15 @@ impl AtomicEntry {
     /// Pack fields into word0.
     ///
     /// Layout:
-    ///   [63:32] key | [31:26] generation | [25:24] bound | [23:16] depth | [15:0] mv
-    fn pack_word0(key32: u32, generation: u8, bound: Bound, depth: u8, mv: Move) -> u64 {
+    ///   [63:32] key | [31:27] generation | [26] is_pv | [25:24] bound | [23:16] depth | [15:0] mv
+    fn pack_word0(key32: u32, generation: u8, is_pv: bool, bound: Bound, depth: u8, mv: Move) -> u64 {
         let key_bits = (key32 as u64) << 32;
-        let gen_bits = ((generation & 0x3F) as u64) << 26;
+        let gen_bits = ((generation & 0x1F) as u64) << 27;
+        let pv_bit = (is_pv as u64) << 26;
         let bound_bits = ((bound as u8) as u64) << 24;
         let depth_bits = (depth as u64) << 16;
         let mv_bits = mv.raw() as u64;
-        key_bits | gen_bits | bound_bits | depth_bits | mv_bits
+        key_bits | gen_bits | pv_bit | bound_bits | depth_bits | mv_bits
     }
 
     /// Pack fields into word1.
@@ -156,19 +160,20 @@ impl AtomicEntry {
     }
 
     /// Decode `word0` into its fields.
-    fn decode_w0(w0: u64) -> (u32, u8, Bound, u8, Move) {
+    fn decode_w0(w0: u64) -> (u32, u8, bool, Bound, u8, Move) {
         let key32 = (w0 >> 32) as u32;
-        let generation = ((w0 >> 26) & 0x3F) as u8;
+        let generation = ((w0 >> 27) & 0x1F) as u8;
+        let is_pv = ((w0 >> 26) & 0x01) != 0;
         let bound = Bound::from_bits(((w0 >> 24) & 0x03) as u8);
         let depth = ((w0 >> 16) & 0xFF) as u8;
         let mv = Move::from_raw((w0 & 0xFFFF) as u16);
-        (key32, generation, bound, depth, mv)
+        (key32, generation, is_pv, bound, depth, mv)
     }
 
     /// Load and verify the entry for `hash`.
     ///
     /// Returns `None` if the key does not match or the XOR check detects a torn write.
-    fn load(&self, hash: u64) -> Option<(u8, Bound, u8, Move, u64, u64)> {
+    fn load(&self, hash: u64) -> Option<(u8, bool, Bound, u8, Move, u64, u64)> {
         let w0 = self.word0.load(Ordering::Relaxed);
         let w1 = self.word1.load(Ordering::Relaxed);
 
@@ -187,8 +192,8 @@ impl AtomicEntry {
             return None;
         }
 
-        let (_, generation, bound, depth, mv) = Self::decode_w0(w0);
-        Some((generation, bound, depth, mv, w0, w1))
+        let (_, generation, is_pv, bound, depth, mv) = Self::decode_w0(w0);
+        Some((generation, is_pv, bound, depth, mv, w0, w1))
     }
 
     /// Store an entry atomically (word0 first, then word1).
@@ -250,7 +255,7 @@ impl TranspositionTable {
     pub fn new_generation(&self) {
         let current = self.generation.load(Ordering::Relaxed);
         self.generation
-            .store(current.wrapping_add(1) & 0x3F, Ordering::Relaxed);
+            .store(current.wrapping_add(1) & 0x1F, Ordering::Relaxed);
     }
 
     /// Probe the table for a position.
@@ -261,7 +266,7 @@ impl TranspositionTable {
         let index = (hash & self.mask) as usize;
         let entry = &self.entries[index];
 
-        let (_, bound, depth, mv, _w0, w1) = entry.load(hash)?;
+        let (_, is_pv, bound, depth, mv, _w0, w1) = entry.load(hash)?;
 
         if bound == Bound::None {
             return None;
@@ -276,6 +281,7 @@ impl TranspositionTable {
             bound,
             score: score_from_tt(score_raw, ply),
             eval: eval_raw as i32,
+            is_pv,
         })
     }
 
@@ -295,6 +301,7 @@ impl TranspositionTable {
         best_move: Move,
         bound: Bound,
         ply: u8,
+        is_pv: bool,
     ) {
         let index = (hash & self.mask) as usize;
         let entry = &self.entries[index];
@@ -302,7 +309,7 @@ impl TranspositionTable {
 
         // Replacement policy — inspect existing entry without key check
         let existing_w0 = entry.peek_w0();
-        let (_, existing_generation, existing_bound, existing_depth, _) =
+        let (_, existing_generation, _existing_is_pv, existing_bound, existing_depth, _) =
             AtomicEntry::decode_w0(existing_w0);
 
         let dominated = existing_bound == Bound::None
@@ -315,7 +322,7 @@ impl TranspositionTable {
         }
 
         let key32 = (hash >> 32) as u32;
-        let w0 = AtomicEntry::pack_word0(key32, generation, bound, depth, best_move);
+        let w0 = AtomicEntry::pack_word0(key32, generation, is_pv, bound, depth, best_move);
         let w1 = AtomicEntry::pack_word1(w0, score_to_tt(score, ply), eval as i16);
         entry.store(w0, w1);
     }
@@ -348,7 +355,7 @@ mod tests {
         let hash: u64 = 0xDEAD_BEEF_1234_5678;
         let mv = Move::new(Square::E2, Square::E4);
 
-        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0);
+        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0, false);
 
         let result = tt.probe(hash, 0).expect("should find stored entry");
         assert_eq!(result.best_move, mv);
@@ -404,13 +411,13 @@ mod tests {
         let mv2 = Move::new(Square::D2, Square::D4);
 
         // Store at depth 10 in generation 0
-        tt.store(hash, 10, 100, 50, mv1, Bound::Exact, 0);
+        tt.store(hash, 10, 100, 50, mv1, Bound::Exact, 0, false);
 
         // Advance generation
         tt.new_generation();
 
         // Store at depth 1 in generation 1 — should replace (different generation)
-        tt.store(hash, 1, 200, 60, mv2, Bound::LowerBound, 0);
+        tt.store(hash, 1, 200, 60, mv2, Bound::LowerBound, 0, false);
 
         let result = tt.probe(hash, 0).unwrap();
         assert_eq!(result.best_move, mv2);
@@ -425,10 +432,10 @@ mod tests {
         let mv2 = Move::new(Square::D2, Square::D4);
 
         // Store at depth 5
-        tt.store(hash, 5, 100, 50, mv1, Bound::LowerBound, 0);
+        tt.store(hash, 5, 100, 50, mv1, Bound::LowerBound, 0, false);
 
         // Try to store at depth 3 (same generation) — should NOT replace
-        tt.store(hash, 3, 200, 60, mv2, Bound::LowerBound, 0);
+        tt.store(hash, 3, 200, 60, mv2, Bound::LowerBound, 0, false);
 
         let result = tt.probe(hash, 0).unwrap();
         assert_eq!(result.best_move, mv1); // original entry preserved
@@ -440,7 +447,7 @@ mod tests {
         let hash: u64 = 0xAAAA_BBBB_CCCC_DDDD;
         let mv = Move::new(Square::E2, Square::E4);
 
-        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0);
+        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0, false);
         assert!(tt.probe(hash, 0).is_some());
 
         tt.clear();
@@ -453,7 +460,7 @@ mod tests {
         let hash: u64 = 0xDEAD_BEEF_1234_5678;
         let mv = Move::new(Square::E2, Square::E4);
 
-        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0);
+        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0, false);
         assert!(tt.probe(hash, 0).is_some(), "entry should be found before corruption");
 
         // Corrupt the check bits in word1 to simulate a torn write
@@ -486,7 +493,7 @@ mod tests {
                         let hash = (t.wrapping_mul(6364136223846793005))
                             .wrapping_add(i.wrapping_mul(2862933555777941757))
                             ^ 0xDEAD_BEEF_CAFE_F00D;
-                        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0);
+                        tt.store(hash, 5, 100, 50, mv, Bound::Exact, 0, false);
                         let _ = tt.probe(hash, 0);
                     }
                 });
