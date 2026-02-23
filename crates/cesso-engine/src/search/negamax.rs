@@ -57,6 +57,9 @@ const SE_DOUBLE_MARGIN: i32 = 23;
 /// Depth threshold above which NMP verification is required.
 const NMP_VERIFY_DEPTH: u8 = 12;
 
+/// Maximum cumulative double extensions allowed per search path.
+const MAX_DOUBLE_EXTENSIONS: u8 = 16;
+
 /// Parameters passed to each negamax call beyond alpha/beta.
 #[derive(Clone, Copy)]
 pub(super) struct NodeParams {
@@ -65,6 +68,7 @@ pub(super) struct NodeParams {
     pub do_null: bool,
     pub excluded: Move,
     pub cutnode: bool,
+    pub double_extensions: u8,
 }
 
 /// Check if the side to move has any non-pawn, non-king material.
@@ -88,12 +92,17 @@ pub(super) fn negamax(
     params: NodeParams,
     ctx: &mut SearchContext<'_>,
 ) -> i32 {
-    let NodeParams { mut depth, ply, do_null, excluded, cutnode } = params;
+    let NodeParams { mut depth, ply, do_null, excluded, cutnode, double_extensions } = params;
     let is_pv = alpha + 1 < beta;
     let is_root = ply == 0;
 
     ctx.pv.clear_ply(ply as usize);
     ctx.nodes += 1;
+
+    // Ply ceiling to prevent out-of-bounds access and runaway recursion
+    if ply as usize >= MAX_PLY {
+        return evaluate(board);
+    }
 
     // Reset cutoff count for this node
     ctx.stack[ply as usize].cutoff_count = 0;
@@ -267,6 +276,7 @@ pub(super) fn negamax(
                 do_null: false,
                 excluded: Move::NULL,
                 cutnode: !cutnode,
+                double_extensions,
             },
             ctx,
         );
@@ -285,6 +295,7 @@ pub(super) fn negamax(
                         do_null: false,
                         excluded: Move::NULL,
                         cutnode: false,
+                        double_extensions,
                     },
                     ctx,
                 );
@@ -330,6 +341,7 @@ pub(super) fn negamax(
                         do_null: true,
                         excluded: Move::NULL,
                         cutnode: !cutnode,
+                        double_extensions,
                     },
                     ctx,
                 );
@@ -477,6 +489,7 @@ pub(super) fn negamax(
                     do_null: false,
                     excluded: mv,
                     cutnode,
+                    double_extensions,
                 },
                 ctx,
             );
@@ -484,7 +497,9 @@ pub(super) fn negamax(
             if singular_score < singular_beta {
                 extension = 1;
                 // Double extension
-                if singular_score < singular_beta - SE_DOUBLE_MARGIN {
+                if singular_score < singular_beta - SE_DOUBLE_MARGIN
+                    && double_extensions < MAX_DOUBLE_EXTENSIONS
+                {
                     extension = 2;
                 }
             } else if singular_score >= beta {
@@ -500,6 +515,7 @@ pub(super) fn negamax(
         }
 
         let new_depth = ((depth as i32 - 1) + extension).max(0) as u8;
+        let child_double_ext = double_extensions + (extension == 2) as u8;
 
         // ── PVS + LMR ───────────────────────────────────────────────────────
         let score;
@@ -515,6 +531,7 @@ pub(super) fn negamax(
                     do_null: true,
                     excluded: Move::NULL,
                     cutnode: false,
+                    double_extensions: child_double_ext,
                 },
                 ctx,
             );
@@ -558,27 +575,24 @@ pub(super) fn negamax(
                     do_null: true,
                     excluded: Move::NULL,
                     cutnode: !cutnode,
+                    double_extensions: child_double_ext,
                 },
                 ctx,
             );
 
             // Re-search at full depth if LMR reduced and score beats alpha
             if do_lmr && sc > alpha && searched_depth < new_depth {
-                let re_depth = if sc > beta + 100 {
-                    new_depth + 1
-                } else {
-                    new_depth
-                };
                 sc = -negamax(
                     &child,
                     -alpha - 1,
                     -alpha,
                     NodeParams {
-                        depth: re_depth.min(127),
+                        depth: new_depth,
                         ply: ply + 1,
                         do_null: true,
                         excluded: Move::NULL,
                         cutnode: !cutnode,
+                        double_extensions: child_double_ext,
                     },
                     ctx,
                 );
@@ -596,6 +610,7 @@ pub(super) fn negamax(
                         do_null: true,
                         excluded: Move::NULL,
                         cutnode: false,
+                        double_extensions: child_double_ext,
                     },
                     ctx,
                 );
@@ -719,6 +734,7 @@ pub(super) fn aspiration_search(
         do_null: true,
         excluded: Move::NULL,
         cutnode: false,
+        double_extensions: 0,
     };
 
     // Full window for shallow depths or near-mate scores
